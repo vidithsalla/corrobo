@@ -1,6 +1,6 @@
 # Dogfood audit 1: this repo (corrobo itself)
 
-Performed by literally following `references/audit-guide.md` steps 1-5 against `/Users/vidithreddy/projects/agent-act-reviewer`. Audit mode only — no code changed as part of this audit.
+Performed by literally following `references/audit-guide.md` steps 1-5 against this repository. Audit mode only — no code changed as part of this audit.
 
 ## Step 1 — candidate side effects found
 
