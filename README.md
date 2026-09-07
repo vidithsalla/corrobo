@@ -99,8 +99,8 @@ Run `npm run example:stripe` for a deterministic walkthrough (no network, no cre
 
 ## Stores
 
-- **In-memory** (`InMemoryStore`) — for tests, examples, and local development only. State lives in process memory: a restart loses every operation record. No crash-survival, no durable-idempotency guarantee.
-- **Postgres** (`corrobo/postgres`) — durable mode intended for real applications. Operation identity and prior evidence survive a process restart. One table, one `CREATE TABLE IF NOT EXISTS` migration (`PostgresStore.migrate(pool)`), no ORM.
+- **In-memory** (`InMemoryStore`) — for tests, examples, and local development only. State lives in process memory: a restart loses every operation record. No crash-survival, no durable-idempotency guarantee. Its concurrency coordination is an in-process mutex only — no cross-process guarantee.
+- **Postgres** (`corrobo/postgres`) — durable mode intended for real applications. Operation identity and prior evidence survive a process restart. One table, one `CREATE TABLE IF NOT EXISTS` migration (`PostgresStore.migrate(pool)`), no ORM. Concurrent callers using the same operation identity are coordinated via a session-scoped Postgres advisory lock, so only one active execution path runs at a time — a crashed process cannot leave a permanent lock, since Postgres releases it when the connection dies. This is not a distributed exactly-once guarantee for the external system; see [`docs/v0.1-spec.md`](docs/v0.1-spec.md#i1-concurrency-two-callers-the-same-operation-identity) for the precise wording.
 
 ## Fault testing
 

@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
-import type { EffectStore, NewOperationInput } from "../core/store";
+import type { EffectStore, NewOperationInput, OperationLock } from "../core/store";
 import type { AttemptRecord, OperationRecord, OperationStatus } from "../core/types";
 
 const TABLE = "corrobo_operations";
@@ -44,13 +45,52 @@ function rowToRecord(row: Row): OperationRecord {
 /**
  * Postgres-backed store: durable across process restarts. This is the mode intended
  * for real applications — operation identity and prior evidence survive a crash.
+ *
+ * Concurrency: tryAcquireLock() uses a session-scoped Postgres advisory lock
+ * (pg_try_advisory_lock), keyed by a hash of the operation identity. It is held on a
+ * dedicated connection checked out from the pool for the duration of one runEffect() pass
+ * (including the external execute()/observe() calls) and released explicitly, or
+ * automatically by Postgres if the connection dies — so a crashed process can never leave a
+ * permanent lock. This deliberately does NOT hold an open transaction or a row lock across
+ * the external call (that would tie up a connection for an unbounded, network-dependent
+ * duration in a way that also blocks other readers of that row); the tradeoff accepted
+ * instead is that one pool connection is held per concurrently in-flight identity for the
+ * duration of its pass — size the pool accordingly under high fan-out concurrency.
  */
 export class PostgresStore implements EffectStore {
-  constructor(private readonly pool: Pool | PoolClient) {}
+  constructor(private readonly pool: Pool) {}
 
   /** Creates the schema if it doesn't exist. Call once at startup. */
   static async migrate(pool: Pool | PoolClient): Promise<void> {
     await pool.query(POSTGRES_SCHEMA_SQL);
+  }
+
+  async tryAcquireLock(identityId: string): Promise<OperationLock | null> {
+    const client = await this.pool.connect();
+    const key = advisoryLockKey(identityId);
+    try {
+      const result = await client.query<{ locked: boolean }>("SELECT pg_try_advisory_lock($1) AS locked", [key]);
+      if (!result.rows[0]?.locked) {
+        client.release();
+        return null;
+      }
+    } catch (err) {
+      client.release();
+      throw err;
+    }
+
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        try {
+          await client.query("SELECT pg_advisory_unlock($1)", [key]);
+        } finally {
+          client.release();
+        }
+      }
+    };
   }
 
   async getOperation(identityId: string): Promise<OperationRecord | null> {
@@ -128,4 +168,16 @@ export class PostgresStore implements EffectStore {
 
 function isUniqueViolation(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === "23505";
+}
+
+/**
+ * Deterministically derives a signed 64-bit key for pg_(try_)advisory_lock from an operation
+ * identity string. A hash collision between two different identities would only cause them
+ * to unnecessarily serialize against each other — never an incorrect safety outcome — since
+ * the actual guarantee comes from Postgres allowing only one holder per key at a time.
+ */
+function advisoryLockKey(identityId: string): string {
+  const digest = createHash("sha256").update(identityId).digest();
+  const unsigned = digest.readBigUInt64BE(0);
+  return BigInt.asIntN(64, unsigned).toString();
 }

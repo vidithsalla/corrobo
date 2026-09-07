@@ -27,6 +27,25 @@ function defaultReviewReason(): ReasonCode {
   };
 }
 
+/** Returned to a caller who lost the coordination race and finds no record yet — vanishingly
+ *  rare (it means the winner's createOperation hasn't committed at the instant this reads),
+ *  but must still be represented honestly rather than guessed at. */
+function resultForInProgress<Observation>(identity: OperationRecord["identity"]): EffectResult<Observation> {
+  return {
+    identity,
+    status: "OPEN",
+    evidenceState: null,
+    disposition: null,
+    evidenceReason: null,
+    dispositionReason: {
+      code: "OPERATION_IN_PROGRESS",
+      summary: "Another caller is currently executing this operation. Call run() again shortly for a result."
+    },
+    observation: null,
+    attempts: []
+  };
+}
+
 /** execute() is caught here — a throw or timeout becomes transport evidence, never an uncaught rejection. */
 async function safeExecute<Intent, Evidence>(
   contract: EffectContract<Intent, unknown, Evidence>,
@@ -166,8 +185,31 @@ async function reObserve<Intent, Observation, Evidence>(
 /**
  * Runs one lifecycle pass for the given intent/identity. Safe to call repeatedly with the
  * same identity: it only invokes execute() when doing so is actually safe (see docs/v0.1-spec.md).
+ *
+ * Coordination: the whole pass runs while holding store.tryAcquireLock(identity.id), so two
+ * genuinely concurrent callers for the SAME identity can never both reach execute(). The loser
+ * does not block — it returns the operation's current recorded state (or an honest
+ * "in progress" placeholder) immediately. Different identities never serialize against each
+ * other. See docs/v0.1-spec.md for the exact guarantee this does and does not provide.
  */
 export async function runEffect<Intent, Observation, Evidence>(
+  store: EffectStore,
+  contract: EffectContract<Intent, Observation, Evidence>,
+  request: EffectRequest<Intent>
+): Promise<EffectResult<Observation>> {
+  const lock = await store.tryAcquireLock(request.identity.id);
+  if (!lock) {
+    const existing = await store.getOperation(request.identity.id);
+    return existing ? resultFromRecord(existing) : resultForInProgress(request.identity);
+  }
+  try {
+    return await runCoordinated(store, contract, request);
+  } finally {
+    await lock.release();
+  }
+}
+
+async function runCoordinated<Intent, Observation, Evidence>(
   store: EffectStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   request: EffectRequest<Intent>

@@ -1,4 +1,4 @@
-import type { EffectStore, NewOperationInput } from "../core/store";
+import type { EffectStore, NewOperationInput, OperationLock } from "../core/store";
 import type { AttemptRecord, OperationRecord, OperationStatus } from "../core/types";
 
 /**
@@ -8,9 +8,30 @@ import type { AttemptRecord, OperationRecord, OperationStatus } from "../core/ty
  * operation record — there is no crash-survival and no durable-idempotency guarantee.
  * Do not use this for anything where a lost operation identity could cause a duplicate
  * side effect after a restart. Use the Postgres store for that.
+ *
+ * tryAcquireLock() is a per-identity in-process mutex: it correctly coordinates concurrent
+ * runEffect() calls WITHIN one Node process (e.g. two overlapping requests to the same
+ * server), but provides no cross-process or distributed guarantee. Use PostgresStore where
+ * multiple processes/workers can race the same operation identity.
  */
 export class InMemoryStore implements EffectStore {
   private readonly records = new Map<string, OperationRecord>();
+  private readonly locked = new Set<string>();
+
+  async tryAcquireLock(identityId: string): Promise<OperationLock | null> {
+    if (this.locked.has(identityId)) {
+      return null;
+    }
+    this.locked.add(identityId);
+    let released = false;
+    return {
+      release: async () => {
+        if (released) return;
+        released = true;
+        this.locked.delete(identityId);
+      }
+    };
+  }
 
   async getOperation(identityId: string): Promise<OperationRecord | null> {
     const record = this.records.get(identityId);
