@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryStore } from "../src/stores/memory";
-import type { AttemptRecord } from "../src/core/types";
+import type { ResolvedAttempt } from "../src/core/types";
 
 const nowIso = () => new Date().toISOString();
 
-function sampleAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
+function sampleAttempt(overrides: Partial<ResolvedAttempt> = {}): ResolvedAttempt {
   return {
+    status: "RESOLVED",
     attemptNumber: 1,
     startedAt: nowIso(),
     updatedAt: nowIso(),
@@ -17,6 +18,13 @@ function sampleAttempt(overrides: Partial<AttemptRecord> = {}): AttemptRecord {
     dispositionReason: { code: "EFFECT_CONFIRMED", summary: "ok" },
     ...overrides
   };
+}
+
+function asResolved(attempt: { status: string }): ResolvedAttempt {
+  if (attempt.status !== "RESOLVED") {
+    throw new Error(`expected a RESOLVED attempt, got ${attempt.status}`);
+  }
+  return attempt as ResolvedAttempt;
 }
 
 describe("InMemoryStore", () => {
@@ -59,8 +67,20 @@ describe("InMemoryStore", () => {
     await store.appendAttempt("c", sampleAttempt({ evidenceState: "PENDING", disposition: null }), "OPEN");
     const resolved = await store.updateLatestAttempt("c", sampleAttempt({ evidenceState: "APPLIED", disposition: "COMPLETE" }), "CLOSED");
     expect(resolved.attempts).toHaveLength(1);
-    expect(resolved.attempts[0].evidenceState).toBe("APPLIED");
+    expect(asResolved(resolved.attempts[0]).evidenceState).toBe("APPLIED");
     expect(resolved.status).toBe("CLOSED");
+  });
+
+  it("reserveAttempt persists a RESERVED attempt before any outcome is known", async () => {
+    const store = new InMemoryStore();
+    await store.createOperation({ identity: { id: "e", operationType: "t" }, intent: {}, status: "OPEN" });
+    const reserved = await store.reserveAttempt("e", { attemptNumber: 1, startedAt: nowIso() });
+    expect(reserved.attempts).toHaveLength(1);
+    expect(reserved.attempts[0].status).toBe("RESERVED");
+
+    const resolved = await store.updateLatestAttempt("e", sampleAttempt(), "CLOSED");
+    expect(resolved.attempts).toHaveLength(1);
+    expect(asResolved(resolved.attempts[0]).evidenceState).toBe("APPLIED");
   });
 
   it("returned records are copies — mutating them does not affect the store", async () => {

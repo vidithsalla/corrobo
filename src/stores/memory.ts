@@ -1,5 +1,5 @@
-import type { EffectStore, NewOperationInput, OperationLock } from "../core/store";
-import type { AttemptRecord, OperationRecord, OperationStatus } from "../core/types";
+import type { CoordinatedStore, EffectStore, NewOperationInput, OperationLock } from "../core/store";
+import type { AttemptRecord, OperationRecord, OperationStatus, ReservedAttemptInput } from "../core/types";
 
 /**
  * In-memory store for tests, examples, and quick local development.
@@ -24,7 +24,9 @@ export class InMemoryStore implements EffectStore {
     }
     this.locked.add(identityId);
     let released = false;
+    const scopedStore: CoordinatedStore = this;
     return {
+      store: scopedStore,
       release: async () => {
         if (released) return;
         released = true;
@@ -53,6 +55,18 @@ export class InMemoryStore implements EffectStore {
       updatedAt: now
     };
     this.records.set(input.identity.id, record);
+    return structuredClone(record);
+  }
+
+  async reserveAttempt(identityId: string, reserved: ReservedAttemptInput): Promise<OperationRecord> {
+    const record = this.mustGet(identityId);
+    record.attempts.push({
+      status: "RESERVED",
+      attemptNumber: reserved.attemptNumber,
+      startedAt: reserved.startedAt,
+      updatedAt: reserved.startedAt
+    });
+    record.updatedAt = new Date().toISOString();
     return structuredClone(record);
   }
 

@@ -36,7 +36,7 @@ const store = new InMemoryStore(); // or PostgresStore, for real durability
 const cancelOrder = {
   operationType: "orders/cancel",
   capabilities: { nativeIdempotency: false, callerGeneratedIdentity: true, optimisticConcurrency: true, convergence: false },
-  retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+  retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
 
   async execute({ intent }) {
     const res = await fetch(`/orders/${intent.orderId}/cancel`, { method: "POST", body: JSON.stringify(intent) });
@@ -85,7 +85,7 @@ intent (refund $50 on charge ch_123)
 [`examples/stripe-refund`](examples/stripe-refund) wraps the official Stripe refunds API the same way `examples/rest` wraps a plain HTTP mutation — same `execute`/`observe`/`reconcile` shape, no adapter framework in between. The corrobo operation `identity` and the Stripe `Idempotency-Key` are tied together deterministically (`refund:<identity.id>`): every attempt of the same logical refund reuses the same key, so a lost response is resolved by asking Stripe what it already recorded, not by guessing. A genuinely new refund requires a new identity, and therefore a new key, by construction.
 
 To be precise about what's actually guaranteed:
-- **Stripe** provides the idempotency guarantee at its own API boundary — the same key never creates two refund objects.
+- **Stripe** provides the idempotency guarantee at its own API boundary — the same key never creates two refund objects, but only for at least 24 hours; the example won't replay past a conservative margin under that window (22h by default) — past it, it honestly reports `UNKNOWN` rather than risk a second refund.
 - **corrobo** persists the operation identity before ever calling Stripe, keeps transport evidence separate from Stripe's authoritative refund state, and derives a conservative disposition from that evidence alone.
 - Together these mean corrobo won't *itself* cause a duplicate refund — they do **not** mean global exactly-once payment behavior. A downstream bank/payment rail issue is outside what either Stripe's or corrobo's guarantees reach.
 
@@ -100,7 +100,7 @@ Run `npm run example:stripe` for a deterministic walkthrough (no network, no cre
 ## Stores
 
 - **In-memory** (`InMemoryStore`) — for tests, examples, and local development only. State lives in process memory: a restart loses every operation record. No crash-survival, no durable-idempotency guarantee. Its concurrency coordination is an in-process mutex only — no cross-process guarantee.
-- **Postgres** (`corrobo/postgres`) — durable mode intended for real applications. Operation identity and prior evidence survive a process restart. One table, one `CREATE TABLE IF NOT EXISTS` migration (`PostgresStore.migrate(pool)`), no ORM. Concurrent callers using the same operation identity are coordinated via a session-scoped Postgres advisory lock, so only one active execution path runs at a time — a crashed process cannot leave a permanent lock, since Postgres releases it when the connection dies. This is not a distributed exactly-once guarantee for the external system; see [`docs/v0.1-spec.md`](docs/v0.1-spec.md#i1-concurrency-two-callers-the-same-operation-identity) for the precise wording.
+- **Postgres** (`corrobo/postgres`) — durable mode intended for real applications. Operation identity and prior evidence survive a process restart: corrobo durably reserves an attempt before `execute()` is ever called, so if a worker dies mid-attempt, the next run observes/reconciles rather than assuming nothing happened and blindly re-executing. One table, one `CREATE TABLE IF NOT EXISTS` migration (`PostgresStore.migrate(pool)`), no ORM. Concurrent callers using the same operation identity are coordinated via a session-scoped Postgres advisory lock held on one dedicated connection for the whole pass — one in-flight identity consumes exactly one pool connection, so `pool.max` bounds how many distinct identities can be in flight at once, not a deadlock risk. A crashed process cannot leave a permanent lock, since Postgres releases it when the connection dies. None of this is a distributed exactly-once guarantee for the external system; see [`docs/v0.1-spec.md`](docs/v0.1-spec.md#i1-concurrency-two-callers-the-same-operation-identity) for the precise wording. A custom `EffectStore` must implement the same `tryAcquireLock` coordination contract to be safe for concurrent use.
 
 ## Fault testing
 

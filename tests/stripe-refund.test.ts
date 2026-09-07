@@ -95,8 +95,12 @@ describe("Stripe refund example", () => {
     await runEffect(store, contract, { identity, intent });
 
     const record = await store.getOperation("refund-4");
-    const refundId = (record?.attempts[0].observations[0] as { data?: { refundId?: string } }).data?.refundId
-      ?? (record?.attempts[0].observations[record.attempts[0].observations.length - 1] as { data?: { refundId?: string } }).data?.refundId;
+    const latest = record?.attempts[0];
+    expect(latest?.status).toBe("RESOLVED");
+    const observations = latest && latest.status === "RESOLVED" ? latest.observations : [];
+    const refundId =
+      (observations[0] as { data?: { refundId?: string } })?.data?.refundId ??
+      (observations[observations.length - 1] as { data?: { refundId?: string } })?.data?.refundId;
     expect(refundId).toBeDefined();
     expect(client.getRefundState(refundId as string)).toBeDefined();
     // A single Stripe key was ever used for this logical operation, and it produced one refund.
@@ -213,8 +217,72 @@ describe("Stripe refund example", () => {
     expect(r1.evidenceState).toBeNull();
     expect(client.createdRefundCount).toBe(0);
 
-    const r2 = await runEffect(store, contract, { identity, intent, reviewApproved: true });
+    const r2 = await runEffect(store, contract, { identity, intent, reviewDecision: "approved" });
     expect(r2.disposition).toBe("COMPLETE");
     expect(client.createdRefundCount).toBe(1);
+  });
+
+  describe("idempotency-key replay safety window", () => {
+    it("replay observation inside the safe window resolves normally", async () => {
+      const client = new FakeStripeClient();
+      client.seedCharge("ch_12", 5000);
+      client.scheduleFault("ch_12", { createFailures: 1, mode: "beforeCommit" });
+      const store = new InMemoryStore();
+      // A generous window: the fake execute()/observe() pair here completes in milliseconds.
+      const contract = createRefundContract({ client, idempotencyReplaySafeWindowMs: 60_000 });
+      const identity = { id: "refund-12", operationType: contract.operationType };
+      const intent = { chargeId: "ch_12", amountCents: 5000 };
+
+      const result = await runEffect(store, contract, { identity, intent });
+      expect(result.evidenceState).toBe("APPLIED");
+      expect(result.disposition).toBe("COMPLETE");
+      expect(client.createdRefundCount).toBe(1);
+    });
+
+    it("replay beyond the safe window is refused — UNKNOWN/INVESTIGATE, no second refund ever created", async () => {
+      const client = new FakeStripeClient();
+      // convergeAsync so the first (in-window) replay creates a real but still-PENDING refund,
+      // exercising the exact re-observation path that keeps re-attempting replay over time.
+      client.seedCharge("ch_13", 5000, { convergeAsync: true });
+      client.scheduleFault("ch_13", { createFailures: 1, mode: "beforeCommit" });
+      const store = new InMemoryStore();
+      const contract = createRefundContract({ client, idempotencyReplaySafeWindowMs: 30 });
+      const identity = { id: "refund-13", operationType: contract.operationType };
+      const intent = { chargeId: "ch_13", amountCents: 5000 };
+
+      const first = await runEffect(store, contract, { identity, intent });
+      expect(first.evidenceState).toBe("PENDING");
+      expect(client.createdRefundCount).toBe(1); // the in-window replay created exactly one refund
+
+      await new Promise((resolve) => setTimeout(resolve, 60)); // now past the 30ms safe window
+
+      const second = await runEffect(store, contract, { identity, intent });
+      expect(second.evidenceState).toBe("UNKNOWN");
+      expect(second.disposition).toBe("INVESTIGATE");
+      expect(client.createdRefundCount).toBe(1); // refusing to replay meant no second refund was created
+    });
+
+    it("once execute() itself returns a stable refund id, later re-observations use direct retrieve, never replay", async () => {
+      const client = new FakeStripeClient();
+      client.seedCharge("ch_14", 5000, { convergeAsync: true }); // no fault: execute() succeeds directly
+      const store = new InMemoryStore();
+      const contract = createRefundContract({ client, idempotencyReplaySafeWindowMs: 30 });
+      const identity = { id: "refund-14", operationType: contract.operationType };
+      const intent = { chargeId: "ch_14", amountCents: 5000 };
+
+      const first = await runEffect(store, contract, { identity, intent });
+      expect(first.evidenceState).toBe("PENDING");
+      expect(client.createdRefundCount).toBe(1);
+
+      // Well past the replay-safety window — if re-observation used replay, this would refuse
+      // and report UNKNOWN. Because execute() returned a stable id, observation uses direct
+      // retrieve instead, which has no expiry, and correctly resolves once convergence finishes.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const second = await runEffect(store, contract, { identity, intent });
+      expect(second.evidenceState).toBe("APPLIED");
+      expect(second.disposition).toBe("COMPLETE");
+      expect(client.createdRefundCount).toBe(1);
+    });
   });
 });

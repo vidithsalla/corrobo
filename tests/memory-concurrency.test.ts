@@ -22,7 +22,7 @@ describe("InMemoryStore concurrency (single-process coordination)", () => {
     const contract: EffectContract<Record<string, never>, unknown, unknown> = {
       operationType: "test/mem-race",
       capabilities: { nativeIdempotency: false, callerGeneratedIdentity: true, optimisticConcurrency: false, convergence: false },
-      retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+      retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
       async execute() {
         executeCalls += 1;
         enteredExecute.resolve(); // proves this caller now holds the lock and is mid-flight
@@ -84,7 +84,7 @@ describe("InMemoryStore concurrency (single-process coordination)", () => {
       return {
         operationType: "test/mem-parallel",
         capabilities: { nativeIdempotency: false, callerGeneratedIdentity: true, optimisticConcurrency: false, convergence: false },
-        retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+        retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
         async execute() {
           concurrentInsideExecute += 1;
           maxConcurrent = Math.max(maxConcurrent, concurrentInsideExecute);

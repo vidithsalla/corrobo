@@ -30,12 +30,27 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Stripe retains an idempotency key for at least 24 hours. Past that window a replayed
+ * create-refund call is no longer guaranteed to return the cached prior result — it can
+ * create a genuine second refund. This default (22h) is a conservative margin under Stripe's
+ * documented guarantee, not the guarantee itself.
+ */
+export const DEFAULT_IDEMPOTENCY_REPLAY_SAFE_WINDOW_MS = 22 * 60 * 60 * 1000;
+
 export function createRefundContract(options: {
   client: StripeClientLike;
   /** Refunds at or above this amount require human authorization before execute() is attempted. */
   reviewThresholdCents?: number;
+  /**
+   * How long after an attempt started it's still safe to replay create-refund (with the same
+   * idempotency key) as an observation strategy. Overridable only so tests can model the
+   * expiry deterministically without a real 24h wait — real callers should rely on the default.
+   */
+  idempotencyReplaySafeWindowMs?: number;
 }): EffectContract<RefundIntent, RefundObservationData, RefundTransportEvidence> {
   const reviewThresholdCents = options.reviewThresholdCents ?? Number.POSITIVE_INFINITY;
+  const replaySafeWindowMs = options.idempotencyReplaySafeWindowMs ?? DEFAULT_IDEMPOTENCY_REPLAY_SAFE_WINDOW_MS;
 
   return {
     operationType: "stripe/refund",
@@ -45,7 +60,7 @@ export function createRefundContract(options: {
       optimisticConcurrency: false,
       convergence: true
     },
-    retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+    retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
 
     authorize(intent) {
       if (intent.amountCents >= reviewThresholdCents) {
@@ -77,10 +92,12 @@ export function createRefundContract(options: {
       }
     },
 
-    async observe({ intent, identity, transport }) {
+    async observe({ intent, identity, transport, attemptStartedAt }) {
       const idempotencyKey = idempotencyKeyFor(identity.id);
 
       // Strongest available evidence: we have a stable refund id, so look it up directly.
+      // Always preferred over replay, and never subject to the replay-window check below,
+      // since a direct retrieve-by-id carries no idempotency-key expiry risk at all.
       if (transport.ok && transport.evidence.kind === "responded") {
         const refund = await options.client.refunds.retrieve(transport.evidence.refundId);
         return observationFromRefund(refund);
@@ -89,7 +106,27 @@ export function createRefundContract(options: {
       // No stable refund id yet — either execute() threw, or Stripe told us synchronously
       // nothing was created. The strongest evidence available now is Stripe's own idempotency
       // semantics: replaying the SAME key either returns the definitive prior outcome or, if
-      // nothing was ever recorded, performs the (still-idempotent) creation for real.
+      // nothing was ever recorded, performs the (still-idempotent) creation for real. But that
+      // is only safe within Stripe's idempotency-key retention window — past it, a replay is
+      // just a new request and could create a genuine second refund, which would be exactly
+      // the failure this project exists to prevent. Refuse it once we can't safely assume the
+      // window still holds, and report the truth: we don't know what happened.
+      const elapsedMs = Date.now() - new Date(attemptStartedAt).getTime();
+      if (elapsedMs > replaySafeWindowMs) {
+        return {
+          status: "observation_failed",
+          error: {
+            message:
+              `Stripe's idempotency key can no longer be safely assumed to resolve to the original ` +
+              `request (~${Math.round(elapsedMs / 3_600_000)}h since the attempt started). Refusing ` +
+              `to replay create-refund, since that could create a second refund. A human should check ` +
+              `Stripe directly for charge ${intent.chargeId} before deciding what to do next.`
+          },
+          source: "stripe:idempotency-window-expired",
+          observedAt: nowIso()
+        };
+      }
+
       try {
         const refund = await options.client.refunds.create(
           { charge: intent.chargeId, amount: intent.amountCents, reason: intent.reason },

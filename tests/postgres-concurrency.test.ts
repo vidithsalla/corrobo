@@ -51,7 +51,7 @@ describe.skipIf(!connectionString)("PostgresStore concurrency (session advisory 
     const contract: EffectContract<Record<string, never>, unknown, unknown> = {
       operationType: "test/pg-race",
       capabilities: { nativeIdempotency: false, callerGeneratedIdentity: true, optimisticConcurrency: false, convergence: false },
-      retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+      retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
       async execute() {
         executeCalls += 1;
         enteredExecute.resolve();
@@ -115,7 +115,7 @@ describe.skipIf(!connectionString)("PostgresStore concurrency (session advisory 
       return {
         operationType: "test/pg-parallel",
         capabilities: { nativeIdempotency: false, callerGeneratedIdentity: true, optimisticConcurrency: false, convergence: false },
-        retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+        retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
         async execute() {
           concurrentInsideExecute += 1;
           maxConcurrent = Math.max(maxConcurrent, concurrentInsideExecute);
@@ -161,7 +161,7 @@ describe.skipIf(!connectionString)("PostgresStore concurrency (session advisory 
     const contract: EffectContract<Record<string, never>, unknown, unknown> = {
       operationType: "test/pg-pending-race",
       capabilities: { nativeIdempotency: false, callerGeneratedIdentity: true, optimisticConcurrency: false, convergence: true },
-      retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+      retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
       async execute() {
         executeCalls += 1;
         enteredExecute.resolve();
@@ -216,7 +216,7 @@ describe.skipIf(!connectionString)("PostgresStore concurrency (session advisory 
     const contract: EffectContract<Record<string, never>, unknown, unknown> = {
       operationType: "test/pg-unknown-race",
       capabilities: { nativeIdempotency: false, callerGeneratedIdentity: true, optimisticConcurrency: false, convergence: false },
-      retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+      retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
       async execute() {
         executeCalls += 1;
         enteredExecute.resolve();

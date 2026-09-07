@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { decideDisposition } from "../src/core/disposition";
 import type { RetryPolicy } from "../src/core/types";
 
-const retryPolicy: RetryPolicy = { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] };
+const retryPolicy: RetryPolicy = { maxAttempts: 3, retryOnNotApplied: true };
 
 describe("decideDisposition", () => {
   it("APPLIED -> COMPLETE", () => {
@@ -32,16 +32,28 @@ describe("decideDisposition", () => {
   });
 
   it("NOT_APPLIED with retry exhausted -> INVESTIGATE, represented conservatively", () => {
-    const exhausted: RetryPolicy = { maxAttempts: 1, retryableEvidenceStates: ["NOT_APPLIED"] };
+    const exhausted: RetryPolicy = { maxAttempts: 1, retryOnNotApplied: true };
     const result = decideDisposition({ evidenceState: "NOT_APPLIED", attemptNumber: 1, retryPolicy: exhausted });
     expect(result.disposition).toBe("INVESTIGATE");
     expect(result.reason.metadata).toMatchObject({ attemptNumber: 1, maxAttempts: 1 });
   });
 
   it("NOT_APPLIED not declared retryable for this operation type -> INVESTIGATE, not RETRY", () => {
-    const noRetry: RetryPolicy = { maxAttempts: 5, retryableEvidenceStates: [] };
+    const noRetry: RetryPolicy = { maxAttempts: 5, retryOnNotApplied: false };
     const result = decideDisposition({ evidenceState: "NOT_APPLIED", attemptNumber: 1, retryPolicy: noRetry });
     expect(result.disposition).toBe("INVESTIGATE");
+  });
+
+  it("UNKNOWN cannot be configured into RETRY — retryOnNotApplied only affects NOT_APPLIED", () => {
+    const alwaysRetry: RetryPolicy = { maxAttempts: 5, retryOnNotApplied: true };
+    const result = decideDisposition({ evidenceState: "UNKNOWN", attemptNumber: 1, retryPolicy: alwaysRetry });
+    expect(result.disposition).toBe("INVESTIGATE");
+  });
+
+  it("PENDING cannot be configured into RETRY — it never carries a disposition", () => {
+    const alwaysRetry: RetryPolicy = { maxAttempts: 5, retryOnNotApplied: true };
+    const result = decideDisposition({ evidenceState: "PENDING", attemptNumber: 1, retryPolicy: alwaysRetry });
+    expect(result.disposition).toBeNull();
   });
 
   it("is deterministic: identical input always produces identical output", () => {

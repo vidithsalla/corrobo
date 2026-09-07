@@ -17,7 +17,7 @@ Using corrobo's real public shape (`EffectContract<Intent, Observation, Evidence
 - **`reconcile()`**: a pure function mapping `(intent, transport, observation)` to one evidence state — reuse the honest mapping worked out in the audit (or redo steps 3-4 of `audit-guide.md` for this operation if it wasn't already audited).
 - **`capabilities`**: `nativeIdempotency`, `callerGeneratedIdentity`, `optimisticConcurrency`, `convergence` — set each based on what step 3-5 of the audit actually found for this operation, not what would be convenient.
 - **`authorize()`** — only if there's a real policy reason (a dollar threshold, a destructive-action gate); it produces `REVIEW`, never an evidence-derived outcome.
-- **Retry policy**: which evidence states are safe to retry (usually just `["NOT_APPLIED"]`) and a sane `maxAttempts`.
+- **Retry policy**: `retryOnNotApplied` (whether a confirmed-absent result is safe to retry for this operation type) and a sane `maxAttempts`. NOT_APPLIED is the only evidence state that can ever become a retry — there is no way to make APPLIED, CONFLICTED, PENDING, or UNKNOWN retryable, and none should be.
 - **Storage**: `PostgresStore` for anything production-shaped, unless the user explicitly chooses otherwise. `InMemoryStore` only for tests/local demos — say this plainly if the target context is production and no store choice was specified.
 
 Keep the proposal to what this ONE operation needs. Do not design a generic adapter/framework layer on top of corrobo's own API — prefer it directly, the way `examples/rest/contract.ts` and `examples/stripe-refund/contract.ts` do in this repo.

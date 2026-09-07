@@ -47,9 +47,16 @@ export interface OperationCapabilities {
   convergence: boolean;
 }
 
+/**
+ * Only NOT_APPLIED is ever a candidate for automatic RETRY — APPLIED always completes,
+ * CONFLICTED always replans, PENDING never carries a disposition, and UNKNOWN always
+ * investigates. There is deliberately no way to configure any of those into an automatic
+ * retry: a field that looked like it accepted "any evidence state" but silently honored only
+ * one was worse than a narrower, honest boolean.
+ */
 export interface RetryPolicy {
   maxAttempts: number;
-  retryableEvidenceStates: EvidenceState[];
+  retryOnNotApplied: boolean;
 }
 
 export interface ReconciliationResult {
@@ -73,6 +80,13 @@ export interface ObserveInput<Intent, Evidence> {
   intent: Intent;
   identity: OperationIdentity;
   transport: TransportOutcome<Evidence>;
+  /**
+   * When this attempt was reserved/started (ISO timestamp) — before execute() was ever
+   * called. Lets a contract reason about time-bounded evidence validity (e.g. a payment
+   * provider's idempotency-key replay window) without corrobo inventing a generic
+   * "freshness" concept it can't honestly define for every API.
+   */
+  attemptStartedAt: string;
 }
 
 export interface ReconcileInput<Intent, Observation, Evidence> {
@@ -94,9 +108,27 @@ export interface EffectContract<Intent, Observation, Evidence> {
   execute(input: ExecuteInput<Intent>): Promise<Evidence>;
   observe(input: ObserveInput<Intent, Evidence>): Promise<ObservationResult<Observation>>;
   reconcile(input: ReconcileInput<Intent, Observation, Evidence>): ReconciliationResult;
+  /**
+   * Optional deterministic fingerprint of an intent, used to detect a reused operation
+   * identity being applied to a logically different intent (see runtime.ts). Defaults to a
+   * stable, key-sorted JSON serialization (src/core/fingerprint.ts) when omitted — provide
+   * this only if that default would treat two meaningfully-different intents as equal, or
+   * two meaningfully-equal intents as different, for this operation type.
+   */
+  fingerprintIntent?(intent: Intent): string;
 }
 
-export interface AttemptRecord {
+/** An attempt whose outcome is not yet known — persisted BEFORE execute() is ever called. */
+export interface ReservedAttempt {
+  status: "RESERVED";
+  attemptNumber: number;
+  startedAt: string;
+  updatedAt: string;
+}
+
+/** An attempt whose outcome has been established via execute()/observe()/reconcile(). */
+export interface ResolvedAttempt {
+  status: "RESOLVED";
   attemptNumber: number;
   startedAt: string;
   updatedAt: string;
@@ -110,6 +142,21 @@ export interface AttemptRecord {
   disposition: RecoveryDisposition | null;
   /** Why that disposition was chosen (from decideDisposition()). */
   dispositionReason: ReasonCode;
+}
+
+/**
+ * An attempt's lifecycle: RESERVED durably records that execution is about to be attempted,
+ * before any external call happens, specifically so a restart can never mistake "we reserved
+ * this attempt but don't know what happened" for "this was never attempted." It resolves to
+ * RESOLVED in place (see EffectStore.updateLatestAttempt) once execute()/observe()/reconcile()
+ * have run. This lifecycle is an internal/store concern — it does not add a sixth evidence
+ * state or disposition.
+ */
+export type AttemptRecord = ReservedAttempt | ResolvedAttempt;
+
+export interface ReservedAttemptInput {
+  attemptNumber: number;
+  startedAt: string;
 }
 
 export interface OperationRecord {
@@ -126,8 +173,8 @@ export interface OperationRecord {
 export interface EffectRequest<Intent> {
   identity: OperationIdentity;
   intent: Intent;
-  /** Set true on a subsequent call to unblock an operation left AWAITING_REVIEW. */
-  reviewApproved?: boolean;
+  /** Set on a subsequent call to resolve an operation left AWAITING_REVIEW. */
+  reviewDecision?: "approved" | "rejected";
 }
 
 export interface EffectResult<Observation> {

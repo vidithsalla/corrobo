@@ -32,7 +32,7 @@ describe.skipIf(!connectionString)("PostgresStore", () => {
         optimisticConcurrency: false,
         convergence: false
       },
-      retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+      retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
       async execute() {
         return { done: true };
       },
@@ -50,7 +50,9 @@ describe.skipIf(!connectionString)("PostgresStore", () => {
     const freshStore = new PostgresStore(freshPool);
     const reloaded = await freshStore.getOperation("pg-op-1");
     expect(reloaded?.status).toBe("CLOSED");
-    expect(reloaded?.attempts[0]?.evidenceState).toBe("APPLIED");
+    const latest = reloaded?.attempts[0];
+    expect(latest?.status).toBe("RESOLVED");
+    expect(latest && latest.status === "RESOLVED" ? latest.evidenceState : undefined).toBe("APPLIED");
     expect(reloaded?.intent).toEqual({ n: 1 });
     await freshPool.end();
   });
@@ -74,7 +76,7 @@ describe.skipIf(!connectionString)("PostgresStore", () => {
         optimisticConcurrency: false,
         convergence: true
       },
-      retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+      retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
       async execute() {
         return { ok: true };
       },

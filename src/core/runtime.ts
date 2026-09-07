@@ -1,5 +1,6 @@
 import { decideDisposition } from "./disposition";
-import type { EffectStore } from "./store";
+import { fingerprintIntent } from "./fingerprint";
+import type { CoordinatedStore, EffectStore } from "./store";
 import type {
   AttemptRecord,
   EffectContract,
@@ -9,6 +10,8 @@ import type {
   OperationRecord,
   OperationStatus,
   ReasonCode,
+  ReservedAttempt,
+  ResolvedAttempt,
   TransportOutcome
 } from "./types";
 
@@ -46,6 +49,33 @@ function resultForInProgress<Observation>(identity: OperationRecord["identity"])
   };
 }
 
+/**
+ * Throws if this identity was already used for a logically different operation — a different
+ * operationType, or the same operationType with a different intent. Never silently return one
+ * operation's result for what is actually a second, unrelated request under the same id.
+ */
+function assertSameLogicalOperation<Intent>(
+  contract: EffectContract<Intent, unknown, unknown>,
+  request: EffectRequest<Intent>,
+  existing: OperationRecord
+): void {
+  if (existing.identity.operationType !== contract.operationType) {
+    throw new Error(
+      `corrobo: operation identity "${request.identity.id}" was already used with operationType ` +
+        `"${existing.identity.operationType}", but this call uses "${contract.operationType}". ` +
+        `Two logically different operations must not share the same identity.`
+    );
+  }
+  const existingFingerprint = fingerprintIntent(contract, existing.intent as Intent);
+  const requestFingerprint = fingerprintIntent(contract, request.intent);
+  if (existingFingerprint !== requestFingerprint) {
+    throw new Error(
+      `corrobo: operation identity "${request.identity.id}" was already used with a different intent ` +
+        `(operationType "${contract.operationType}"). Two logically different operations must not share the same identity.`
+    );
+  }
+}
+
 /** execute() is caught here — a throw or timeout becomes transport evidence, never an uncaught rejection. */
 async function safeExecute<Intent, Evidence>(
   contract: EffectContract<Intent, unknown, Evidence>,
@@ -66,10 +96,11 @@ async function safeObserve<Intent, Observation, Evidence>(
   contract: EffectContract<Intent, Observation, Evidence>,
   intent: Intent,
   identity: OperationRecord["identity"],
-  transport: TransportOutcome<Evidence>
+  transport: TransportOutcome<Evidence>,
+  attemptStartedAt: string
 ): Promise<ObservationResult<Observation>> {
   try {
-    return await contract.observe({ intent, identity, transport });
+    return await contract.observe({ intent, identity, transport, attemptStartedAt });
   } catch (err) {
     return {
       status: "observation_failed",
@@ -82,18 +113,45 @@ async function safeObserve<Intent, Observation, Evidence>(
 
 function resultFromRecord<Observation>(record: OperationRecord): EffectResult<Observation> {
   const latest = record.attempts[record.attempts.length - 1];
+
   if (!latest) {
+    // No attempt exists at all: either still AWAITING_REVIEW, or CLOSED because a review was
+    // rejected before execute() was ever called (see runCoordinated).
+    const dispositionReason =
+      record.status === "CLOSED"
+        ? {
+            code: "POLICY_REVIEW_REJECTED",
+            summary: "This operation was reviewed and rejected; it will not be attempted."
+          }
+        : (record.reviewReason ?? defaultReviewReason());
     return {
       identity: record.identity,
       status: record.status,
       evidenceState: null,
       disposition: "REVIEW",
       evidenceReason: null,
-      dispositionReason: record.reviewReason ?? defaultReviewReason(),
+      dispositionReason,
       observation: null,
       attempts: record.attempts
     };
   }
+
+  if (latest.status === "RESERVED") {
+    return {
+      identity: record.identity,
+      status: record.status,
+      evidenceState: null,
+      disposition: null,
+      evidenceReason: null,
+      dispositionReason: {
+        code: "ATTEMPT_IN_PROGRESS",
+        summary: "An attempt has been reserved but not yet resolved. Call run() again shortly for a result."
+      },
+      observation: null,
+      attempts: record.attempts
+    };
+  }
+
   const latestObservation = latest.observations[latest.observations.length - 1] ?? null;
   return {
     identity: record.identity,
@@ -107,8 +165,27 @@ function resultFromRecord<Observation>(record: OperationRecord): EffectResult<Ob
   };
 }
 
+function resolvedFrom(
+  reserved: Pick<ReservedAttempt | ResolvedAttempt, "attemptNumber" | "startedAt">,
+  fields: Omit<ResolvedAttempt, "status" | "attemptNumber" | "startedAt" | "updatedAt">
+): ResolvedAttempt {
+  return {
+    status: "RESOLVED",
+    attemptNumber: reserved.attemptNumber,
+    startedAt: reserved.startedAt,
+    updatedAt: nowIso(),
+    ...fields
+  };
+}
+
+/**
+ * Reserves an attempt, then attempts the real side effect. Reservation is durably persisted
+ * BEFORE execute() is called, specifically so a crash between a successful execute() and this
+ * function's final persist can never be mistaken, on restart, for "never attempted" — see
+ * recoverReservedAttempt below, which is what actually runs in that case.
+ */
 async function performAttempt<Intent, Observation, Evidence>(
-  store: EffectStore,
+  store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   record: OperationRecord,
   intent: Intent
@@ -116,8 +193,10 @@ async function performAttempt<Intent, Observation, Evidence>(
   const attemptNumber = record.attempts.length + 1;
   const startedAt = nowIso();
 
+  await store.reserveAttempt(record.identity.id, { attemptNumber, startedAt });
+
   const transport = await safeExecute(contract, intent, record.identity, attemptNumber);
-  const observation = await safeObserve(contract, intent, record.identity, transport);
+  const observation = await safeObserve(contract, intent, record.identity, transport, startedAt);
   const reconciliation = contract.reconcile({ intent, transport, observation });
   const { disposition, reason: dispositionReason } = decideDisposition({
     evidenceState: reconciliation.evidenceState,
@@ -125,22 +204,70 @@ async function performAttempt<Intent, Observation, Evidence>(
     retryPolicy: contract.retryPolicy
   });
 
-  const attempt: AttemptRecord = {
-    attemptNumber,
-    startedAt,
-    updatedAt: nowIso(),
+  const attempt = resolvedFrom(
+    { attemptNumber, startedAt },
+    {
+      transport: transport as TransportOutcome<unknown>,
+      observations: [observation as ObservationResult<unknown>],
+      evidenceState: reconciliation.evidenceState,
+      evidenceReason: reconciliation.reason,
+      disposition,
+      dispositionReason
+    }
+  );
+
+  const nextStatus: OperationStatus =
+    disposition === "RETRY" || reconciliation.evidenceState === "PENDING" ? "OPEN" : "CLOSED";
+
+  const updated = await store.updateLatestAttempt(record.identity.id, attempt, nextStatus);
+  return resultFromRecord(updated);
+}
+
+/**
+ * Restart-time recovery for an attempt that was reserved but never resolved (the process died
+ * somewhere between execute() being called and the outcome being persisted). Never calls
+ * execute() again here — goes straight to observe()/reconcile() using an honest "transport
+ * outcome unknown" value, exactly the same ok:false shape used for a genuine execute() throw.
+ * This is not fabricated evidence: it truthfully states that execute()'s outcome was never
+ * recorded, which is all corrobo actually knows at this point.
+ */
+async function recoverReservedAttempt<Intent, Observation, Evidence>(
+  store: CoordinatedStore,
+  contract: EffectContract<Intent, Observation, Evidence>,
+  record: OperationRecord,
+  intent: Intent,
+  reserved: ReservedAttempt
+): Promise<EffectResult<Observation>> {
+  const transport: TransportOutcome<Evidence> = {
+    ok: false,
+    error: {
+      message:
+        "This attempt was reserved before execute() ran, but no resolution was ever recorded " +
+        "(the process may have restarted mid-attempt). The transport outcome of execute() is unknown."
+    }
+  };
+
+  const observation = await safeObserve(contract, intent, record.identity, transport, reserved.startedAt);
+  const reconciliation = contract.reconcile({ intent, transport, observation });
+  const { disposition, reason: dispositionReason } = decideDisposition({
+    evidenceState: reconciliation.evidenceState,
+    attemptNumber: reserved.attemptNumber,
+    retryPolicy: contract.retryPolicy
+  });
+
+  const attempt = resolvedFrom(reserved, {
     transport: transport as TransportOutcome<unknown>,
     observations: [observation as ObservationResult<unknown>],
     evidenceState: reconciliation.evidenceState,
     evidenceReason: reconciliation.reason,
     disposition,
     dispositionReason
-  };
+  });
 
   const nextStatus: OperationStatus =
     disposition === "RETRY" || reconciliation.evidenceState === "PENDING" ? "OPEN" : "CLOSED";
 
-  const updated = await store.appendAttempt(record.identity.id, attempt, nextStatus);
+  const updated = await store.updateLatestAttempt(record.identity.id, attempt, nextStatus);
   return resultFromRecord(updated);
 }
 
@@ -150,14 +277,14 @@ async function performAttempt<Intent, Observation, Evidence>(
  * takes this path, never performAttempt.
  */
 async function reObserve<Intent, Observation, Evidence>(
-  store: EffectStore,
+  store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   record: OperationRecord,
   intent: Intent,
-  latest: AttemptRecord
+  latest: ResolvedAttempt
 ): Promise<EffectResult<Observation>> {
   const transport = latest.transport as TransportOutcome<Evidence>;
-  const observation = await safeObserve(contract, intent, record.identity, transport);
+  const observation = await safeObserve(contract, intent, record.identity, transport, latest.startedAt);
   const reconciliation = contract.reconcile({ intent, transport, observation });
   const { disposition, reason: dispositionReason } = decideDisposition({
     evidenceState: reconciliation.evidenceState,
@@ -165,7 +292,7 @@ async function reObserve<Intent, Observation, Evidence>(
     retryPolicy: contract.retryPolicy
   });
 
-  const updatedAttempt: AttemptRecord = {
+  const updatedAttempt: ResolvedAttempt = {
     ...latest,
     updatedAt: nowIso(),
     observations: [...latest.observations, observation as ObservationResult<unknown>],
@@ -186,8 +313,10 @@ async function reObserve<Intent, Observation, Evidence>(
  * Runs one lifecycle pass for the given intent/identity. Safe to call repeatedly with the
  * same identity: it only invokes execute() when doing so is actually safe (see docs/v0.1-spec.md).
  *
- * Coordination: the whole pass runs while holding store.tryAcquireLock(identity.id), so two
- * genuinely concurrent callers for the SAME identity can never both reach execute(). The loser
+ * Coordination: the whole pass runs while holding store.tryAcquireLock(identity.id), using the
+ * lock's own bound store (lock.store) for every operation in the pass, so two genuinely
+ * concurrent callers for the SAME identity can never both reach execute(), and one in-flight
+ * identity never needs more than the one session/connection its lock already holds. The loser
  * does not block — it returns the operation's current recorded state (or an honest
  * "in progress" placeholder) immediately. Different identities never serialize against each
  * other. See docs/v0.1-spec.md for the exact guarantee this does and does not provide.
@@ -200,21 +329,29 @@ export async function runEffect<Intent, Observation, Evidence>(
   const lock = await store.tryAcquireLock(request.identity.id);
   if (!lock) {
     const existing = await store.getOperation(request.identity.id);
-    return existing ? resultFromRecord(existing) : resultForInProgress(request.identity);
+    if (!existing) {
+      return resultForInProgress(request.identity);
+    }
+    assertSameLogicalOperation(contract, request, existing);
+    return resultFromRecord(existing);
   }
   try {
-    return await runCoordinated(store, contract, request);
+    return await runCoordinated(lock.store, contract, request);
   } finally {
     await lock.release();
   }
 }
 
 async function runCoordinated<Intent, Observation, Evidence>(
-  store: EffectStore,
+  store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   request: EffectRequest<Intent>
 ): Promise<EffectResult<Observation>> {
   const existing = await store.getOperation(request.identity.id);
+
+  if (existing) {
+    assertSameLogicalOperation(contract, request, existing);
+  }
 
   if (!existing) {
     const auth = contract.authorize ? await contract.authorize(request.intent) : { requiresReview: false };
@@ -223,7 +360,7 @@ async function runCoordinated<Intent, Observation, Evidence>(
       identity: request.identity,
       intent: request.intent,
       status: initialStatus,
-      reviewReason: auth.requiresReview ? auth.reason ?? defaultReviewReason() : undefined
+      reviewReason: auth.requiresReview ? (auth.reason ?? defaultReviewReason()) : undefined
     });
 
     if (auth.requiresReview) {
@@ -237,7 +374,11 @@ async function runCoordinated<Intent, Observation, Evidence>(
   }
 
   if (existing.status === "AWAITING_REVIEW") {
-    if (!request.reviewApproved) {
+    if (request.reviewDecision === "rejected") {
+      const closed = await store.setStatus(existing.identity.id, "CLOSED");
+      return resultFromRecord(closed);
+    }
+    if (request.reviewDecision !== "approved") {
       return resultFromRecord(existing);
     }
     const reopened = await store.setStatus(existing.identity.id, "OPEN");
@@ -250,6 +391,10 @@ async function runCoordinated<Intent, Observation, Evidence>(
     return await performAttempt(store, contract, existing, request.intent);
   }
 
+  if (latest.status === "RESERVED") {
+    return await recoverReservedAttempt(store, contract, existing, request.intent, latest);
+  }
+
   if (latest.evidenceState === "PENDING") {
     return await reObserve(store, contract, existing, request.intent, latest);
   }
@@ -258,7 +403,8 @@ async function runCoordinated<Intent, Observation, Evidence>(
     return await performAttempt(store, contract, existing, request.intent);
   }
 
-  // OPEN with a latest attempt that is neither PENDING nor RETRY shouldn't occur
-  // (performAttempt/reObserve always close otherwise) — return current state rather than guessing.
+  // OPEN with a resolved latest attempt that is neither PENDING nor RETRY shouldn't occur
+  // (performAttempt/reObserve/recoverReservedAttempt always close otherwise) — return current
+  // state rather than guessing.
   return resultFromRecord(existing);
 }

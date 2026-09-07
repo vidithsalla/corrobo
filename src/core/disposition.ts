@@ -58,7 +58,7 @@ export function decideDisposition(input: DecideDispositionInput): DecideDisposit
       };
 
     case "NOT_APPLIED": {
-      const retryable = retryPolicy.retryableEvidenceStates.includes("NOT_APPLIED");
+      const retryable = retryPolicy.retryOnNotApplied;
       const hasAttemptsRemaining = attemptNumber < retryPolicy.maxAttempts;
       if (retryable && hasAttemptsRemaining) {
         return {

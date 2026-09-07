@@ -29,7 +29,7 @@ function makeContract(opts: {
       optimisticConcurrency: false,
       convergence: false
     },
-    retryPolicy: opts.retryPolicy ?? { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+    retryPolicy: opts.retryPolicy ?? { maxAttempts: 3, retryOnNotApplied: true },
     authorize: opts.authorize,
     async execute() {
       executeCalls += 1;
@@ -94,7 +94,7 @@ describe("runEffect", () => {
     expect(r1.evidenceState).toBeNull();
     expect(getExecuteCalls()).toBe(0);
 
-    const r2 = await runEffect(store, contract, { identity, intent: {}, reviewApproved: true });
+    const r2 = await runEffect(store, contract, { identity, intent: {}, reviewDecision: "approved" });
     expect(r2.disposition).toBe("COMPLETE");
     expect(getExecuteCalls()).toBe(1);
   });
@@ -185,7 +185,7 @@ describe("runEffect", () => {
   it("retry exhaustion is represented conservatively (INVESTIGATE, not a silent stop or a forced retry)", async () => {
     const store = new InMemoryStore();
     const { contract } = makeContract({
-      retryPolicy: { maxAttempts: 1, retryableEvidenceStates: ["NOT_APPLIED"] },
+      retryPolicy: { maxAttempts: 1, retryOnNotApplied: true },
       observeQueue: [{ status: "observed", data: { done: false }, authoritative: true, source: "t", observedAt: nowIso() }],
       reconcileImpl: () => ({ evidenceState: "NOT_APPLIED", reason: { code: "ABSENT", summary: "x" } })
     });
@@ -199,7 +199,7 @@ describe("runEffect", () => {
   it("reason-code metadata survives persistence through the store", async () => {
     const store = new InMemoryStore();
     const { contract } = makeContract({
-      retryPolicy: { maxAttempts: 1, retryableEvidenceStates: ["NOT_APPLIED"] },
+      retryPolicy: { maxAttempts: 1, retryOnNotApplied: true },
       observeQueue: [{ status: "observed", data: { done: false }, authoritative: true, source: "t", observedAt: nowIso() }],
       reconcileImpl: () => ({ evidenceState: "NOT_APPLIED", reason: { code: "ABSENT", summary: "x" } })
     });
@@ -207,7 +207,9 @@ describe("runEffect", () => {
 
     await runEffect(store, contract, { identity, intent: {} });
     const record = await store.getOperation("id-10");
-    expect(record?.attempts[0].dispositionReason.metadata).toMatchObject({
+    const latest = record?.attempts[0];
+    expect(latest?.status).toBe("RESOLVED");
+    expect(latest && latest.status === "RESOLVED" ? latest.dispositionReason.metadata : undefined).toMatchObject({
       attemptNumber: 1,
       maxAttempts: 1,
       retryable: true

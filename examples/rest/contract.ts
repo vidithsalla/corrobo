@@ -55,7 +55,7 @@ export function createCancelOrderContract(options: {
       optimisticConcurrency: true,
       convergence: true
     },
-    retryPolicy: { maxAttempts: 3, retryableEvidenceStates: ["NOT_APPLIED"] },
+    retryPolicy: { maxAttempts: 3, retryOnNotApplied: true },
 
     async execute({ intent, attemptNumber }) {
       lastAttemptNumber = attemptNumber;
