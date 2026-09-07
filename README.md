@@ -68,6 +68,29 @@ result.disposition;   // "COMPLETE" | "RETRY" | "REPLAN" | "REVIEW" | "INVESTIGA
 
 `runEffect` is safe to call again with the same `identity`: it only calls `execute()` when doing so is actually safe (a fresh operation, or a prior `RETRY`). A completed, conflicted, or under-review operation returns its recorded result instead of re-attempting the mutation. See [`examples/rest`](examples/rest) for a runnable walkthrough of every scenario below against a real local HTTP server.
 
+## Flagship example: Stripe refunds
+
+Timeout does not mean the refund failed.
+
+```
+intent (refund $50 on charge ch_123)
+  → Stripe call, with an Idempotency-Key derived from the operation identity
+  → the response never arrives (timeout)
+  → observe(): Stripe's OWN idempotency cache is asked what actually happened
+  → a refund already exists and succeeded
+  → APPLIED → COMPLETE
+  → no duplicate refund is ever created
+```
+
+[`examples/stripe-refund`](examples/stripe-refund) wraps the official Stripe refunds API the same way `examples/rest` wraps a plain HTTP mutation — same `execute`/`observe`/`reconcile` shape, no adapter framework in between. The corrobo operation `identity` and the Stripe `Idempotency-Key` are tied together deterministically (`refund:<identity.id>`): every attempt of the same logical refund reuses the same key, so a lost response is resolved by asking Stripe what it already recorded, not by guessing. A genuinely new refund requires a new identity, and therefore a new key, by construction.
+
+To be precise about what's actually guaranteed:
+- **Stripe** provides the idempotency guarantee at its own API boundary — the same key never creates two refund objects.
+- **corrobo** persists the operation identity before ever calling Stripe, keeps transport evidence separate from Stripe's authoritative refund state, and derives a conservative disposition from that evidence alone.
+- Together these mean corrobo won't *itself* cause a duplicate refund — they do **not** mean global exactly-once payment behavior. A downstream bank/payment rail issue is outside what either Stripe's or corrobo's guarantees reach.
+
+Run `npm run example:stripe` for a deterministic walkthrough (no network, no credentials) of every case above plus a conflicting refund amount, an asynchronously-settling refund, and a high-value refund that requires human review before Stripe is ever called. An optional `npm run example:stripe:live-smoke` exercises the same contract against the real Stripe test-mode API if `STRIPE_SECRET_KEY` (a `sk_test_...` key) is set — it is skipped, not required, otherwise.
+
 ## What this is not
 
 - Not an exactly-once guarantee. corrobo cannot promise a third-party system it doesn't control never double-processes anything — only that its own recorded decision was derived from real evidence, not a guess.

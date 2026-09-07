@@ -29,6 +29,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "example:rest": "tsx examples/rest/demo.ts",
+    "example:stripe": "tsx examples/stripe-refund/demo.ts",
+    "example:stripe:live-smoke": "tsx examples/stripe-refund/live-smoke.ts",
     "verify": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
@@ -37,6 +39,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
+    "stripe": "^17.4.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
