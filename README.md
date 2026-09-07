@@ -106,6 +106,21 @@ Run `npm run example:stripe` for a deterministic walkthrough (no network, no cre
 
 `corrobo/testing` provides deterministic fault injection — `FaultSchedule`, `withFaultInjection`, `withObservationFault` — for wrapping your *own* real delegate calls in tests, so you can simulate "the mutation happened but the response was lost" or "the read-back failed" without corrobo's runtime ever being aware faults exist. It lives outside `src/core` on purpose: nothing in the production path imports it.
 
+## Agent Skill (integration assistant)
+
+[`skills/corrobo`](skills/corrobo) is a small Agent Skill (SKILL.md + reference docs, no runtime code) for Claude Code / Codex-style coding agents. It helps a developer *find* consequential mutations with unsafe retry assumptions in an existing codebase and *scaffold* an integration — it audits and proposes, then implements only when explicitly asked.
+
+It does not provide any safety guarantee itself:
+
+```
+Agent Skill      -> helps a developer identify + integrate
+corrobo runtime  -> owns operation identity, coordination, execution evidence,
+                     observation, reconciliation, disposition, persistence
+External system  -> owns authoritative business truth
+```
+
+corrobo is not "an AI skill" — the skill is an optional adoption aid on top of a runtime that works identically with or without an LLM involved.
+
 ## Development
 
 ```
