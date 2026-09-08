@@ -1,7 +1,6 @@
 {
   "name": "corrobo",
   "version": "0.1.0",
-  "private": true,
   "description": "A small deterministic runtime for reconciling side-effecting operations: separates transport evidence from business truth and produces a conservative recovery disposition.",
   "license": "MIT",
   "homepage": "https://github.com/vidithsalla/corrobo#readme",
