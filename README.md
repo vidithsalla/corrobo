@@ -1,5 +1,7 @@
 # corrobo
 
+[![npm version](https://img.shields.io/npm/v/corrobo.svg)](https://www.npmjs.com/package/corrobo)
+
 What happens when a state-changing API call times out and you don't know whether the change happened?
 
 Most code answers that question by accident: a caught exception becomes "it failed, retry," and a successful response becomes "it worked." Neither is reliable. A timeout doesn't mean the write didn't happen — it just means the response didn't arrive. Retrying on that assumption is how you double-charge a customer or double-cancel an order.
