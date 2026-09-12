@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import type { CoordinatedStore, EffectStore, NewOperationInput, OperationLock } from "../core/store";
-import type { AttemptRecord, OperationRecord, OperationStatus, ReservedAttemptInput } from "../core/types";
+import type {
+  AttemptRecord,
+  ObservationResult,
+  OperationRecord,
+  OperationStatus,
+  ReservedAttemptInput,
+  TransportOutcome
+} from "../core/types";
 
 const TABLE = "corrobo_operations";
 
@@ -52,6 +59,48 @@ function mustReturnRow(identityId: string, row: Row | undefined): OperationRecor
     throw new Error(`corrobo: unknown operation identity "${identityId}"`);
   }
   return rowToRecord(row);
+}
+
+/**
+ * PostgresStore's own durable-persistence boundary: strips `error.raw` — the caller's raw
+ * thrown value, whatever shape it is — from the two specific locations it can appear
+ * (a failed transport outcome, and a failed observation), before anything is written to
+ * Postgres. `error.message` (a plain string) is kept. This is deliberately narrow: it does
+ * not scan for "secret-looking" field names anywhere else (intent, observedEffect, reason
+ * metadata) — that would give false confidence over data this store has no way to safely
+ * judge. It only removes the one field known, by construction, to be an unexamined
+ * passthrough of an arbitrary caller-supplied error object (see runtime.ts's safeExecute/
+ * safeObserve). Never mutates the input — returns a new object so the in-memory
+ * EffectResult for the current call (built before this runs) is unaffected.
+ */
+function sanitizeAttemptForPersistence(attempt: AttemptRecord): AttemptRecord {
+  if (attempt.status !== "RESOLVED") {
+    return attempt; // a RESERVED attempt carries no transport/observation data at all
+  }
+  return {
+    ...attempt,
+    transport: sanitizeTransportForPersistence(attempt.transport),
+    observations: attempt.observations.map(sanitizeObservationForPersistence)
+  };
+}
+
+function sanitizeTransportForPersistence(transport: TransportOutcome<unknown>): TransportOutcome<unknown> {
+  if (transport.ok) {
+    return transport; // the success branch carries no error object at all
+  }
+  return { ok: false, error: { message: transport.error.message } };
+}
+
+function sanitizeObservationForPersistence(observation: ObservationResult<unknown>): ObservationResult<unknown> {
+  if (observation.status !== "observation_failed") {
+    return observation; // "observed"/"pending" never carry an error.raw field
+  }
+  return {
+    status: "observation_failed",
+    error: { message: observation.error.message },
+    source: observation.source,
+    observedAt: observation.observedAt
+  };
 }
 
 function isUniqueViolation(err: unknown): boolean {
@@ -132,7 +181,7 @@ async function appendAttemptImpl(
      SET attempts = attempts || $2::jsonb, status = $3, updated_at = now()
      WHERE id = $1
      RETURNING *`,
-    [identityId, JSON.stringify([attempt]), status]
+    [identityId, JSON.stringify([sanitizeAttemptForPersistence(attempt)]), status]
   );
   return mustReturnRow(identityId, result.rows[0]);
 }
@@ -150,7 +199,7 @@ async function updateLatestAttemptImpl(
          updated_at = now()
      WHERE id = $1
      RETURNING *`,
-    [identityId, JSON.stringify(attempt), status]
+    [identityId, JSON.stringify(sanitizeAttemptForPersistence(attempt)), status]
   );
   return mustReturnRow(identityId, result.rows[0]);
 }
@@ -192,9 +241,32 @@ function boundStore(q: Queryable): CoordinatedStore {
  * different lock keys and never serialize against each other; the connection is not held
  * across a transaction and does not lock the row itself, so ordinary reads of that row by
  * other tools are never blocked.
+ *
+ * Persistence acknowledgement: constructing a PostgresStore durably writes operation state —
+ * including whatever application-supplied intent, transport evidence, observations, and
+ * reason metadata your contracts produce — into the database you configure, with no
+ * automatic expiry (see README's "Privacy and data handling" section). This is not
+ * telemetry, not a network permission dialog, and not a corrobo account setting — it is a
+ * one-time, code-level acknowledgement that you understand this store is durable.
  */
+export interface PostgresStoreOptions {
+  /** Must be the literal `true`. See the persistence-acknowledgement note above. */
+  acknowledgePersistence: true;
+}
+
 export class PostgresStore implements EffectStore {
-  constructor(private readonly pool: Pool) {}
+  constructor(
+    private readonly pool: Pool,
+    options: PostgresStoreOptions
+  ) {
+    if (!options || options.acknowledgePersistence !== true) {
+      throw new Error(
+        "corrobo: PostgresStore persists operation state to the configured database, including " +
+          "application-supplied intent/evidence/observations/reason metadata, and corrobo does not " +
+          "automatically expire those records. Pass { acknowledgePersistence: true } to explicitly opt in."
+      );
+    }
+  }
 
   /** Creates the schema if it doesn't exist. Call once at startup. */
   static async migrate(pool: Pool | PoolClient): Promise<void> {

@@ -23,7 +23,7 @@ describe.skipIf(!connectionString)("PostgresStore", () => {
   });
 
   it("persists an operation and reloads it via a fresh pool, simulating a process restart", async () => {
-    const store = new PostgresStore(pool);
+    const store = new PostgresStore(pool, { acknowledgePersistence: true });
     const contract: EffectContract<{ n: number }, unknown, unknown> = {
       operationType: "test/pg",
       capabilities: {
@@ -47,7 +47,7 @@ describe.skipIf(!connectionString)("PostgresStore", () => {
     expect(result.disposition).toBe("COMPLETE");
 
     const freshPool = new Pool({ connectionString });
-    const freshStore = new PostgresStore(freshPool);
+    const freshStore = new PostgresStore(freshPool, { acknowledgePersistence: true });
     const reloaded = await freshStore.getOperation("pg-op-1");
     expect(reloaded?.status).toBe("CLOSED");
     const latest = reloaded?.attempts[0];
@@ -58,7 +58,7 @@ describe.skipIf(!connectionString)("PostgresStore", () => {
   });
 
   it("rejects creating a duplicate operation identity", async () => {
-    const store = new PostgresStore(pool);
+    const store = new PostgresStore(pool, { acknowledgePersistence: true });
     await store.createOperation({ identity: { id: "pg-dup", operationType: "t" }, intent: {}, status: "OPEN" });
     await expect(
       store.createOperation({ identity: { id: "pg-dup", operationType: "t" }, intent: {}, status: "OPEN" })
@@ -66,7 +66,7 @@ describe.skipIf(!connectionString)("PostgresStore", () => {
   });
 
   it("supports the PENDING -> re-observe -> APPLIED lifecycle durably, across separate calls", async () => {
-    const store = new PostgresStore(pool);
+    const store = new PostgresStore(pool, { acknowledgePersistence: true });
     let observeCall = 0;
     const contract: EffectContract<Record<string, never>, unknown, unknown> = {
       operationType: "test/pg-pending",

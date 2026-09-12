@@ -41,7 +41,7 @@ describe.skipIf(!connectionString)("PostgresStore connection-pool deadlock regre
   });
 
   it("N >= pool.max concurrent distinct identities complete without deadlocking, and genuinely overlap", async () => {
-    const store = new PostgresStore(tinyPool);
+    const store = new PostgresStore(tinyPool, { acknowledgePersistence: true });
     const identityCount = 3; // > pool.max (2)
     let concurrentInsideExecute = 0;
     let maxConcurrent = 0;

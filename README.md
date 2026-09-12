@@ -108,6 +108,18 @@ See [`docs/v0.1-spec.md`](docs/v0.1-spec.md) for the full type-level contract, i
 
 See [`docs/v0.1-spec.md`](docs/v0.1-spec.md#i1-concurrency-two-callers-the-same-operation-identity) for the precise wording of what this does and doesn't guarantee.
 
+Constructing `PostgresStore` requires an explicit acknowledgement:
+
+```ts
+import { PostgresStore } from "corrobo/postgres";
+
+const store = new PostgresStore(pool, {
+  acknowledgePersistence: true
+});
+```
+
+The acknowledgement is intentional: `PostgresStore` durably stores operation state in the database you provide, with no automatic expiry, so constructing it should be a deliberate choice rather than something that happens by accident. It's a one-time, code-level flag — not a prompt, not telemetry, not a network permission, and not a corrobo account setting. `InMemoryStore` needs no such acknowledgement, since it never persists anything beyond the current process. See [Privacy and data handling](#privacy-and-data-handling) below for exactly what gets stored.
+
 ## Examples
 
 - **[`examples/rest`](examples/rest)** — a generic order-cancellation HTTP mutation against a real local server (no external credentials). Run `npm run example:rest` for a deterministic walkthrough of normal success, timeout-before-write, timeout-after-write (the headline case), a stale-version conflict, async `PENDING` convergence, and an unresolvable `UNKNOWN`.
@@ -156,6 +168,25 @@ Precisely:
 - `PENDING` means "observe again later," never "execute again" — re-execution never happens just because convergence is incomplete.
 - Whether a retry is safe is entirely a function of the operation's own declared semantics (`retryPolicy.retryOnNotApplied`) — corrobo enforces the policy a contract declares, it does not infer safety on its own.
 - Not a polling/orchestration engine: `PENDING` is modeled and re-observable, but corrobo does not schedule *when* you call `run()` again.
+
+## Privacy and data handling
+
+corrobo has no telemetry and no hosted service. The runtime does not send application data to corrobo or its maintainer. Your effects go to the systems your application already calls, and `PostgresStore` persists reliability state only in the database you configure.
+
+Corrobo does not know whether the application data you provide contains personal or sensitive information. Intent, evidence, observations, reason metadata, and error messages may be persisted by `PostgresStore`. Raw thrown error objects are excluded from Postgres persistence, but developers should still avoid placing secrets or unnecessary sensitive data in persisted fields.
+
+More precisely:
+
+- **`InMemoryStore`** stays inside the current process. It performs no persistence and no network I/O of its own, and it's primarily intended for development and testing.
+- **`PostgresStore`** is explicitly opt-in (see above) and only talks to the `Pool`/database you supply — it may be local or remote depending entirely on how you configure it. It persists reliability state in that database, including whatever application-supplied data your contracts produce: `intent`, transport evidence, observations, and reason metadata.
+- **As of this version, raw thrown error objects are not persisted by `PostgresStore`** — only `error.message` (a plain string) is. This closes off the most likely accidental-secret-exposure path (an HTTP client's error object commonly carries the original request's headers, including auth tokens, and the response body, which can carry customer data). A developer can still write a sensitive error message themselves — e.g. `` throw new Error(`Failed for token ${token}`) `` — and corrobo has no way to safely tell a normal message apart from a sensitive one. **Do not include credentials or secrets in thrown error messages.**
+- Corrobo does **not** inspect, filter, or minimize arbitrary application data placed in `intent`, evidence, observations, or reason metadata. This is intentional — the whole point of these fields being generic is what makes corrobo framework-agnostic — but it means the responsibility for what goes into them is yours.
+- **Persisted records do not automatically expire.** Retention and deletion are controlled entirely by you, on the Postgres database you operate.
+
+Two claims worth being explicit about, because they're easy to get wrong in either direction:
+
+- **"Corrobo never handles personal data"** — false. If you pass personal data into an intent, observation, or error message, corrobo will hold it in memory and, with `PostgresStore`, persist it.
+- **"Corrobo never sends data off the user's computer"** — false whenever you configure a remote Postgres database, or your own `execute()`/`observe()` functions call remote systems (which, for almost any real integration, they will).
 
 ## Development
 

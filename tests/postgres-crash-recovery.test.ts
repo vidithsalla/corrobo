@@ -70,7 +70,7 @@ describe.skipIf(!connectionString)("crash recovery: reserved-but-unresolved atte
   }
 
   it("a reserved attempt exists before execute() is ever called", async () => {
-    const store = new PostgresStore(poolA);
+    const store = new PostgresStore(poolA, { acknowledgePersistence: true });
     let sawReservedInsideExecute = false;
 
     const contract: EffectContract<Record<string, never>, unknown, unknown> = {
@@ -108,13 +108,13 @@ describe.skipIf(!connectionString)("crash recovery: reserved-but-unresolved atte
       `INSERT INTO corrobo_operations (id, operation_type, intent, status, attempts) VALUES ($1, $2, '{}'::jsonb, 'OPEN', '[]'::jsonb)`,
       [identity.id, identity.operationType]
     );
-    const reserveStore = new PostgresStore(poolA);
+    const reserveStore = new PostgresStore(poolA, { acknowledgePersistence: true });
     await reserveStore.reserveAttempt(identity.id, { attemptNumber: 1, startedAt: new Date().toISOString() });
     external.mutationCount = 1; // the real effect already happened, corrobo just doesn't know it
 
     // "Restart": a fresh pool and store, exactly like a new process.
     const poolB = new Pool({ connectionString });
-    const storeB = new PostgresStore(poolB);
+    const storeB = new PostgresStore(poolB, { acknowledgePersistence: true });
 
     const result = await runEffect(storeB, contract, { identity, intent: {} });
 
@@ -135,12 +135,12 @@ describe.skipIf(!connectionString)("crash recovery: reserved-but-unresolved atte
       `INSERT INTO corrobo_operations (id, operation_type, intent, status, attempts) VALUES ($1, $2, '{}'::jsonb, 'OPEN', '[]'::jsonb)`,
       [identity.id, identity.operationType]
     );
-    const reserveStore = new PostgresStore(poolA);
+    const reserveStore = new PostgresStore(poolA, { acknowledgePersistence: true });
     await reserveStore.reserveAttempt(identity.id, { attemptNumber: 1, startedAt: new Date().toISOString() });
     // external.mutationCount stays 0: the crash happened before execute() ever ran for real.
 
     const poolB = new Pool({ connectionString });
-    const storeB = new PostgresStore(poolB);
+    const storeB = new PostgresStore(poolB, { acknowledgePersistence: true });
 
     const result = await runEffect(storeB, contract, { identity, intent: {} });
     expect(result.evidenceState).toBe("NOT_APPLIED");
@@ -165,11 +165,11 @@ describe.skipIf(!connectionString)("crash recovery: reserved-but-unresolved atte
       `INSERT INTO corrobo_operations (id, operation_type, intent, status, attempts) VALUES ($1, $2, '{}'::jsonb, 'OPEN', '[]'::jsonb)`,
       [identity.id, identity.operationType]
     );
-    const reserveStore = new PostgresStore(poolA);
+    const reserveStore = new PostgresStore(poolA, { acknowledgePersistence: true });
     await reserveStore.reserveAttempt(identity.id, { attemptNumber: 1, startedAt: new Date().toISOString() });
 
     const poolB = new Pool({ connectionString });
-    const storeB = new PostgresStore(poolB);
+    const storeB = new PostgresStore(poolB, { acknowledgePersistence: true });
 
     const result = await runEffect(storeB, contract, { identity, intent: {} });
     expect(result.evidenceState).toBe("UNKNOWN");

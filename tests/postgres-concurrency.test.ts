@@ -41,8 +41,8 @@ describe.skipIf(!connectionString)("PostgresStore concurrency (session advisory 
   });
 
   it("CASE 1: two concurrent callers racing the SAME identity cause exactly one external mutation", async () => {
-    const storeA = new PostgresStore(poolA);
-    const storeB = new PostgresStore(poolB);
+    const storeA = new PostgresStore(poolA, { acknowledgePersistence: true });
+    const storeB = new PostgresStore(poolB, { acknowledgePersistence: true });
     const barrier = deferred<void>();
     const enteredExecute = deferred<void>();
     let executeCalls = 0;
@@ -102,8 +102,8 @@ describe.skipIf(!connectionString)("PostgresStore concurrency (session advisory 
   });
 
   it("CASE 2: different identities execute concurrently without serializing behind a global lock", async () => {
-    const storeA = new PostgresStore(poolA);
-    const storeB = new PostgresStore(poolB);
+    const storeA = new PostgresStore(poolA, { acknowledgePersistence: true });
+    const storeB = new PostgresStore(poolB, { acknowledgePersistence: true });
     const barrierA = deferred<void>();
     const barrierB = deferred<void>();
     const enteredA = deferred<void>();
@@ -151,8 +151,8 @@ describe.skipIf(!connectionString)("PostgresStore concurrency (session advisory 
   });
 
   it("CASE 3: a race resolving to PENDING does not cause a second execute(), and convergence still requires only one", async () => {
-    const storeA = new PostgresStore(poolA);
-    const storeB = new PostgresStore(poolB);
+    const storeA = new PostgresStore(poolA, { acknowledgePersistence: true });
+    const storeB = new PostgresStore(poolB, { acknowledgePersistence: true });
     const barrier = deferred<void>();
     const enteredExecute = deferred<void>();
     let executeCalls = 0;
@@ -207,8 +207,8 @@ describe.skipIf(!connectionString)("PostgresStore concurrency (session advisory 
   });
 
   it("CASE 5: a race resolving to UNKNOWN does not turn coordination into an unsafe second execution", async () => {
-    const storeA = new PostgresStore(poolA);
-    const storeB = new PostgresStore(poolB);
+    const storeA = new PostgresStore(poolA, { acknowledgePersistence: true });
+    const storeB = new PostgresStore(poolB, { acknowledgePersistence: true });
     const barrier = deferred<void>();
     const enteredExecute = deferred<void>();
     let executeCalls = 0;
