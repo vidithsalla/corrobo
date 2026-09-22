@@ -39,8 +39,12 @@
   },
   "typesVersions": {
     "*": {
-      "postgres": ["dist/stores/postgres.d.ts"],
-      "testing": ["dist/testing/index.d.ts"]
+      "postgres": [
+        "dist/stores/postgres.d.ts"
+      ],
+      "testing": [
+        "dist/testing/index.d.ts"
+      ]
     }
   },
   "engines": {
@@ -54,6 +58,8 @@
     "example:rest": "tsx examples/rest/demo.ts",
     "example:stripe": "tsx examples/stripe-refund/demo.ts",
     "example:stripe:live-smoke": "tsx examples/stripe-refund/live-smoke.ts",
+    "example:jev": "tsx examples/jev-refund/demo.ts",
+    "example:jev:live": "tsx examples/jev-refund/live.ts",
     "verify": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
@@ -62,6 +68,7 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
+    "@typesafe-ai/sdk": "^0.6.0",
     "stripe": "^17.4.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",

@@ -124,6 +124,7 @@ The acknowledgement is intentional: `PostgresStore` durably stores operation sta
 
 - **[`examples/rest`](examples/rest)** — a generic order-cancellation HTTP mutation against a real local server (no external credentials). Run `npm run example:rest` for a deterministic walkthrough of normal success, timeout-before-write, timeout-after-write (the headline case), a stale-version conflict, async `PENDING` convergence, and an unresolvable `UNKNOWN`.
 - **[`examples/stripe-refund`](examples/stripe-refund)** — see below.
+- **[`examples/jev-refund`](examples/jev-refund)** — a probabilistic pre-execution judgment (using TypeSafe AI's Jev) feeding a deterministic `authorize()` policy, with corrobo owning execution and post-execution reconciliation. Run `npm run example:jev` (no API key needed). See [Jev / probabilistic decision systems](#jev--probabilistic-decision-systems) below.
 
 ### Flagship example: Stripe refunds
 
@@ -135,6 +136,33 @@ To be precise about what's actually guaranteed:
 - **Stripe** provides the idempotency guarantee at its own API boundary — the same key never creates two refund objects, but only for at least 24 hours. The example won't replay past a conservative margin under that window (22h by default), and once a stable refund id is known, it prefers a direct lookup by id over replaying the key at all. Past the safe window with no id known, it honestly reports `UNKNOWN` rather than risk a second refund.
 - **corrobo** persists the operation identity before ever calling Stripe, keeps transport evidence separate from Stripe's authoritative refund state, and derives a conservative disposition from that evidence alone.
 - Together these mean corrobo won't *itself* cause a duplicate refund — they do **not** mean global exactly-once payment behavior. A downstream bank/payment rail issue is outside what either Stripe's or corrobo's guarantees reach.
+
+## Jev / probabilistic decision systems
+
+The general pattern:
+
+```
+probabilistic decision system -> deterministic policy -> corrobo -> authoritative observation
+```
+
+corrobo is model-independent — this is not a corrobo feature specific to any one provider. Systems
+such as TypeSafe AI's Jev can be used *before* execution to classify, score, or route an action.
+Application code should convert those outputs into deterministic policy (a threshold, a rule);
+corrobo then owns the mutation lifecycle and post-execution reconciliation, exactly as it does for
+any other operation. The model is never asked to determine whether a side effect actually
+happened once authoritative evidence is available.
+
+[`examples/jev-refund`](examples/jev-refund) is an example integration with TypeSafe AI's Jev
+demonstrating this: a refund request gets a bounded, typed judgment from Jev (risk score,
+confidence, and whether it's clearly a refund request), deterministic application thresholds turn
+that into a `requiresReview` decision passed to corrobo's existing `authorize()` hook, and corrobo
+handles everything from there — `execute()`, authoritative `observe()` against the (fake, local)
+refund ledger, and `reconcile()`. Jev is consulted exactly once, before the first attempt, and
+never again — including when resolving an ambiguous transport failure after a write has already
+landed. `npm run example:jev` runs it fully deterministically, with no API key or network access;
+see [`docs/jev-integration.md`](docs/jev-integration.md) for the full writeup, including the
+privacy/data boundary of a live Jev integration (which is different from corrobo's own — see
+below) and the optional live mode.
 
 ## Agent Skill (integration assistant)
 
