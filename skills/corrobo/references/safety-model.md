@@ -38,6 +38,31 @@ Any custom `EffectStore` implementation must satisfy the same same-identity coor
 - **No final success from HTTP 200 alone.** A 200/202 proves the request was accepted, not that the business effect is final — some operations report `pending`/`requires_action`/an async status after a synchronous-looking response.
 - **`UNKNOWN` and `PENDING` are legitimate, final-for-now answers**, not signs the audit/integration is incomplete. If the target system genuinely can't provide better evidence, say so.
 
+## Probabilistic decision systems feeding `authorize()`
+
+An application may use a classifier, scoring model, or system like TypeSafe AI's Jev to help
+decide whether an action should proceed automatically or need human sign-off. When proposing or
+reviewing such an integration:
+
+- A model's output (a score, a probability, a classification) may inform pre-execution routing,
+  risk assessment, or the `requiresReview` decision passed to `authorize()`. It is INPUT to
+  policy, never the policy itself — deterministic application code (a threshold, a rule) must
+  interpret it, exactly as `examples/jev-refund/contract.ts` does.
+- Model output is never authoritative evidence that a side effect actually happened. After
+  `execute()` has been attempted, only real `observe()`/`reconcile()` against the system of
+  record can establish evidence state — never re-consult the judgment model to resolve an
+  ambiguous transport outcome. See `examples/jev-refund` for a concrete demonstration of this
+  boundary (its "timeout after write" scenario).
+- `UNKNOWN`/`PENDING` stay `UNKNOWN`/`PENDING` even when a model is confident about something —
+  never convert unresolved evidence into false certainty based only on an AI/model judgment.
+- If the integration calls an external judgment provider (e.g. a hosted model API), only send the
+  minimum state needed for that specific judgment, and note that provider's own privacy/data
+  policy is separate from corrobo's (which has none — see the main README's Privacy section).
+  Never claim corrobo controls a third-party provider's data handling.
+
+This is a generic rule, not Jev-specific guidance — see `docs/jev-integration.md` in this repo for
+one worked example, not a template to force onto every operation.
+
 ## Where corrobo's actual API sits (for integration mode)
 
 - Core lifecycle: `intent → authorize()? → execute() → observe() → reconcile() → evidence state → disposition`.
