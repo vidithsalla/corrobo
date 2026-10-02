@@ -30,27 +30,15 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-/**
- * Stripe retains an idempotency key for at least 24 hours. Past that window a replayed
- * create-refund call is no longer guaranteed to return the cached prior result — it can
- * create a genuine second refund. This default (22h) is a conservative margin under Stripe's
- * documented guarantee, not the guarantee itself.
- */
-export const DEFAULT_IDEMPOTENCY_REPLAY_SAFE_WINDOW_MS = 22 * 60 * 60 * 1000;
+/** The metadata key each refund carries: the corrobo operation it belongs to. */
+export const OPERATION_METADATA_KEY = "corrobo_operation";
 
 export function createRefundContract(options: {
   client: StripeClientLike;
   /** Refunds at or above this amount require human authorization before execute() is attempted. */
   reviewThresholdCents?: number;
-  /**
-   * How long after an attempt started it's still safe to replay create-refund (with the same
-   * idempotency key) as an observation strategy. Overridable only so tests can model the
-   * expiry deterministically without a real 24h wait — real callers should rely on the default.
-   */
-  idempotencyReplaySafeWindowMs?: number;
 }): EffectContract<RefundIntent, RefundObservationData, RefundTransportEvidence> {
   const reviewThresholdCents = options.reviewThresholdCents ?? Number.POSITIVE_INFINITY;
-  const replaySafeWindowMs = options.idempotencyReplaySafeWindowMs ?? DEFAULT_IDEMPOTENCY_REPLAY_SAFE_WINDOW_MS;
 
   return {
     operationType: "stripe/refund",
@@ -84,7 +72,12 @@ export function createRefundContract(options: {
       const idempotencyKey = idempotencyKeyFor(identity.id);
       try {
         const refund = await options.client.refunds.create(
-          { charge: intent.chargeId, amount: intent.amountCents, reason: intent.reason },
+          {
+            charge: intent.chargeId,
+            amount: intent.amountCents,
+            reason: intent.reason,
+            metadata: { [OPERATION_METADATA_KEY]: identity.id }
+          },
           { idempotencyKey }
         );
         return { kind: "responded", refundId: refund.id, status: refund.status };
@@ -96,59 +89,34 @@ export function createRefundContract(options: {
       }
     },
 
-    async observe({ intent, identity, transport, attemptStartedAt }) {
-      const idempotencyKey = idempotencyKeyFor(identity.id);
-
-      // Strongest available evidence: we have a stable refund id, so look it up directly.
-      // Always preferred over replay, and never subject to the replay-window check below,
-      // since a direct retrieve-by-id carries no idempotency-key expiry risk at all.
+    // observe() only ever reads. It runs when nothing may be executed (crash recovery, the
+    // re-check before a retry, after an approval has expired), so it must never be able to
+    // create a refund itself; replaying create-refund here would do exactly that whenever the
+    // original request never reached Stripe.
+    async observe({ intent, identity, transport }) {
+      // Strongest evidence: execute() got a refund id back, so look that refund up directly.
       if (transport.ok && transport.evidence.kind === "responded") {
         const refund = await options.client.refunds.retrieve(transport.evidence.refundId);
         return observationFromRefund(refund);
       }
 
-      // No stable refund id yet — either execute() threw, or Stripe told us synchronously
-      // nothing was created. The strongest evidence available now is Stripe's own idempotency
-      // semantics: replaying the SAME key either returns the definitive prior outcome or, if
-      // nothing was ever recorded, performs the (still-idempotent) creation for real. But that
-      // is only safe within Stripe's idempotency-key retention window — past it, a replay is
-      // just a new request and could create a genuine second refund, which would be exactly
-      // the failure this project exists to prevent. Refuse it once we can't safely assume the
-      // window still holds, and report the truth: we don't know what happened.
-      const elapsedMs = Date.now() - new Date(attemptStartedAt).getTime();
-      if (elapsedMs > replaySafeWindowMs) {
-        return {
-          status: "observation_failed",
-          error: {
-            message:
-              `Stripe's idempotency key can no longer be safely assumed to resolve to the original ` +
-              `request (~${Math.round(elapsedMs / 3_600_000)}h since the attempt started). Refusing ` +
-              `to replay create-refund, since that could create a second refund. A human should check ` +
-              `Stripe directly for charge ${intent.chargeId} before deciding what to do next.`
-          },
-          source: "stripe:idempotency-window-expired",
-          observedAt: nowIso()
-        };
+      // Otherwise (execute() threw, or Stripe rejected the request): find this operation's
+      // refund, if any, among the charge's refunds by the metadata execute() attached. Stripe's
+      // list endpoint reflects writes immediately (unlike its Search API), so "not there" is a
+      // real answer. A throw here becomes observation_failed -> UNKNOWN, never NOT_APPLIED.
+      const { data } = await options.client.refunds.list({ charge: intent.chargeId, limit: 100 });
+      const ours = data.find((refund) => refund.metadata?.[OPERATION_METADATA_KEY] === identity.id);
+      if (ours) {
+        return observationFromRefund(ours);
       }
-
-      try {
-        const refund = await options.client.refunds.create(
-          { charge: intent.chargeId, amount: intent.amountCents, reason: intent.reason },
-          { idempotencyKey }
-        );
-        return observationFromRefund(refund);
-      } catch (err) {
-        if (isDefiniteRejection(err)) {
-          return {
-            status: "observed",
-            data: { exists: false, rejectionCode: err.code, rejectionMessage: err.message },
-            authoritative: true,
-            source: "stripe:refunds.create-replay",
-            observedAt: nowIso()
-          };
-        }
-        throw err; // genuinely can't establish the truth — safeObserve turns this into observation_failed
-      }
+      const rejection = transport.ok && transport.evidence.kind === "rejected" ? transport.evidence : undefined;
+      return {
+        status: "observed",
+        data: { exists: false, rejectionCode: rejection?.code, rejectionMessage: rejection?.message },
+        authoritative: true,
+        source: "stripe:refunds.list",
+        observedAt: nowIso()
+      };
     },
 
     reconcile({ observation }) {
@@ -157,7 +125,7 @@ export function createRefundContract(options: {
           evidenceState: "UNKNOWN",
           reason: {
             code: "READBACK_UNAVAILABLE",
-            summary: "Neither a direct lookup nor an idempotency-key replay could establish whether the refund exists.",
+            summary: "Neither a direct lookup nor the charge's refund list could establish whether the refund exists.",
             metadata: { error: observation.error.message }
           }
         };

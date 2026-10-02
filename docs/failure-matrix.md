@@ -18,7 +18,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 1.4 | Request lands **late**, after corrobo first looked | Applied, but later | First `NOT_APPLIED` → `RETRY` (deferred); the re-check before retrying finds `APPLIED` → `COMPLETE` | No | No | Call again after `retryNotBefore` | T7, T8 |
 | 1.5 | Transport failure, contract declares no `maxInFlightMs` | Unknown whether it will land | `NOT_APPLIED` → `INVESTIGATE` (`IN_FLIGHT_NOT_RULED_OUT`) | No | No | Decide manually, or declare `maxInFlightMs` | T9, T10 |
 | 1.6 | `execute()` returned a response, but the effect isn't there | Not applied, request finished | `NOT_APPLIED` → `RETRY` immediately (per retry policy) | Yes, once | No | Nothing | T13, T42 |
-| 1.7 | Transport failure with provider-side idempotency | Either; the provider deduplicates | The contract sends one key on every attempt and in its read-back, so a replay returns the original result instead of a second effect; with `maxInFlightMs: 0` the retry decision is immediate | Possibly, deduplicated by the provider | No, within the provider's key retention | Keep the key stable per operation. **Assumes:** the provider really deduplicates on it | T14, T15, T92 |
+| 1.7 | Transport failure with provider-side idempotency | Either; the provider deduplicates | The contract sends one key on every attempt, so a retry while the first request is still in flight returns the original result instead of a second effect; its read-back only reads (it never re-sends the request); with `maxInFlightMs: 0` the retry decision is immediate | Possibly, deduplicated by the provider | No, within the provider's key retention | Keep the key stable per operation. **Assumes:** the provider really deduplicates on it | T14, T15, T92 |
 
 ## 2. Crash boundaries
 
@@ -163,9 +163,10 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 | # | Situation | Behavior | Proof |
 |---|---|---|---|
 | 11.1 | Provider idempotency key | Same key on every attempt of one operation; a new operation never reuses it | T92, T93 |
-| 11.2 | Idempotency replay window expired (e.g. Stripe's ~24h) | Replay refused: `UNKNOWN` → `INVESTIGATE`, never a new refund | T94 |
+| 11.2 | A lost response, or a re-check long after the attempt (past the key's retention, e.g. Stripe's ~24h) | The read-back finds the refund by the operation id the request carried in its metadata, so it never relies on the key's retention; the request is only re-sent by a retry, with the same key | T94 |
 | 11.3 | Stable provider id known from `execute()` | Later checks look it up directly | T95 |
 | 11.4 | Lookup only by search/listing | **Assumes:** your contract returns `UNKNOWN` when absence can't be proven — see 3.4 | T30 |
+| 11.5 | An `observe()` that could create the effect (e.g. replaying the create request as its "read-back") | Not allowed: `observe()` runs where nothing may execute (crash recovery, re-checks, after an approval expired), so it must only read. The Stripe example reads only; an expired approval leads to review, not a refund | T181 |
 
 ## 12. What corrobo itself does on your machine
 
@@ -197,7 +198,7 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T11** [`tests/fencing.test.ts`](../tests/fencing.test.ts) — "after the window, a settled NOT_APPLIED retries in the same call"
 - **T12** [`tests/fencing-adversarial.test.ts`](../tests/fencing-adversarial.test.ts) — "returns cached RETRY before retryNotBefore without executing or observing"
 - **T13** [`tests/fencing-adversarial.test.ts`](../tests/fencing-adversarial.test.ts) — "retries immediately when transport ok:true proves the request is no longer in flight"
-- **T14** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "timeout BEFORE Stripe ever processes the request self-heals in one call via the idempotency replay"
+- **T14** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "timeout BEFORE Stripe ever processes the request: observe() only reads and finds nothing; the retry with the same key creates exactly one refund"
 - **T15** [`tests/disposition.test.ts`](../tests/disposition.test.ts) — "maxInFlightMs: 0 (re-execution provider-deduplicated) -> ordinary RETRY immediately"
 - **T16** [`tests/postgres-crash-recovery.test.ts`](../tests/postgres-crash-recovery.test.ts) — "a reserved attempt exists before execute() is ever called"
 - **T17** [`tests/runtime.test.ts`](../tests/runtime.test.ts) — "persists operation identity and intent before execute() runs, even if execute() throws"
@@ -277,8 +278,8 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T91** [`tests/fencing.test.ts`](../tests/fencing.test.ts) — "a 0.2.x RETRY whose request landed late: the settlement check finds APPLIED, no second effect"
 - **T92** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "reuses the same Stripe idempotency key across attempts of the same logical operation"
 - **T93** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "a NEW logical operation (new identity) never reuses an old idempotency key"
-- **T94** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "replay beyond the safe window is refused — UNKNOWN/INVESTIGATE, no second refund ever created"
-- **T95** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "once execute() itself returns a stable refund id, later re-observations use direct retrieve, never replay"
+- **T94** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "a lost response long after the attempt is still found by its metadata: no reliance on the idempotency key's retention"
+- **T95** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "once execute() itself returns a stable refund id, later re-observations retrieve it directly"
 - **T96** [`tests/failure-catalog.test.ts`](../tests/failure-catalog.test.ts) — "no logging of any kind in src/ (application payloads are never printed by corrobo)"
 - **T97** [`tests/failure-catalog.test.ts`](../tests/failure-catalog.test.ts) — "no network-capable code in src/ except PostgresStore's use of the pool you pass in"
 - **T98** [`tests/failure-catalog.test.ts`](../tests/failure-catalog.test.ts) — "the core and InMemoryStore make no network calls of their own"
@@ -362,5 +363,6 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T178** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "%s is refused before anything runs"
 - **T179** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "is persisted on the attempt and read back by another process"
 - **T180** [`tests/recorded-intent.test.ts`](../tests/recorded-intent.test.ts) — "with a custom fingerprint, a later request can't change what the reviewer approved"
+- **T181** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "observe() never creates a refund: an approval that expired while the request was lost leads to review, not a refund"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"

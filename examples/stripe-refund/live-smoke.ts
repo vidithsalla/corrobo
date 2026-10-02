@@ -27,7 +27,8 @@ function toRefundStatus(status: string | null): RefundStatus {
 
 function toRefundLike(refund: Stripe.Refund): RefundLike {
   const charge = typeof refund.charge === "string" ? refund.charge : (refund.charge?.id ?? "");
-  return { id: refund.id, status: toRefundStatus(refund.status), amount: refund.amount, charge };
+  const metadata = Object.fromEntries(Object.entries(refund.metadata ?? {}).map(([k, v]) => [k, String(v)]));
+  return { id: refund.id, status: toRefundStatus(refund.status), amount: refund.amount, charge, metadata };
 }
 
 async function main(): Promise<void> {
@@ -49,13 +50,22 @@ async function main(): Promise<void> {
     refunds: {
       async create(params, opts) {
         const refund = await stripe.refunds.create(
-          { charge: params.charge, amount: params.amount, reason: params.reason as Stripe.RefundCreateParams.Reason },
+          {
+            charge: params.charge,
+            amount: params.amount,
+            reason: params.reason as Stripe.RefundCreateParams.Reason,
+            metadata: params.metadata
+          },
           { idempotencyKey: opts.idempotencyKey }
         );
         return toRefundLike(refund);
       },
       async retrieve(id) {
         return toRefundLike(await stripe.refunds.retrieve(id));
+      },
+      async list(params) {
+        const page = await stripe.refunds.list({ charge: params.charge, limit: params.limit });
+        return { data: page.data.map(toRefundLike) };
       }
     }
   };

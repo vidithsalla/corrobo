@@ -27,6 +27,8 @@ interface ChargeFaults {
   createFailures: number;
   mode: "beforeCommit" | "afterCommit";
   retrieveFailures: number;
+  /** How many subsequent list() calls for this charge should throw a generic (ambiguous) error. */
+  listFailures: number;
 }
 
 /**
@@ -57,7 +59,7 @@ export class FakeStripeClient implements StripeClientLike {
 
   /** Injects N ambiguous (non-Stripe-shaped) failures on the next create()/retrieve() calls for a charge. */
   scheduleFault(chargeId: string, fault: Partial<ChargeFaults>): void {
-    const existing = this.faults.get(chargeId) ?? { createFailures: 0, mode: "beforeCommit", retrieveFailures: 0 };
+    const existing = this.faults.get(chargeId) ?? { createFailures: 0, mode: "beforeCommit", retrieveFailures: 0, listFailures: 0 };
     this.faults.set(chargeId, { ...existing, ...fault });
   }
 
@@ -74,13 +76,19 @@ export class FakeStripeClient implements StripeClientLike {
   }
 
   refunds = {
-    create: (params: { charge: string; amount: number; reason?: string }, opts: { idempotencyKey: string }): Promise<RefundLike> =>
-      this.doCreate(params, opts.idempotencyKey),
-    retrieve: (id: string): Promise<RefundLike> => this.doRetrieve(id)
+    create: (
+      params: { charge: string; amount: number; reason?: string; metadata?: Record<string, string> },
+      opts: { idempotencyKey: string }
+    ): Promise<RefundLike> => this.doCreate(params, opts.idempotencyKey),
+    retrieve: (id: string): Promise<RefundLike> => this.doRetrieve(id),
+    list: (params: { charge: string; limit?: number }): Promise<{ data: RefundLike[] }> => this.doList(params)
   };
 
+  /** How many read calls (retrieve + list) were made. Reads never create anything. For test assertions. */
+  reads = 0;
+
   private async doCreate(
-    params: { charge: string; amount: number; reason?: string },
+    params: { charge: string; amount: number; reason?: string; metadata?: Record<string, string> },
     idempotencyKey: string
   ): Promise<RefundLike> {
     this.idempotencyKeysReceived.push(idempotencyKey);
@@ -115,7 +123,8 @@ export class FakeStripeClient implements StripeClientLike {
       id,
       charge: params.charge,
       amount: params.amount,
-      status: charge.convergeAsync ? "pending" : charge.terminalFailure ? "failed" : "succeeded"
+      status: charge.convergeAsync ? "pending" : charge.terminalFailure ? "failed" : "succeeded",
+      ...(params.metadata ? { metadata: { ...params.metadata } } : {})
     };
 
     if (!charge.terminalFailure) {
@@ -145,7 +154,19 @@ export class FakeStripeClient implements StripeClientLike {
     return refund;
   }
 
+  private async doList(params: { charge: string; limit?: number }): Promise<{ data: RefundLike[] }> {
+    this.reads += 1;
+    const fault = this.faults.get(params.charge);
+    if (fault && fault.listFailures > 0) {
+      fault.listFailures -= 1;
+      throw new Error("simulated network failure during list");
+    }
+    const data = [...this.byId.values()].filter((r) => r.charge === params.charge).slice(0, params.limit ?? 10);
+    return { data };
+  }
+
   private async doRetrieve(id: string): Promise<RefundLike> {
+    this.reads += 1;
     const refund = this.byId.get(id);
     const fault = refund ? this.faults.get(refund.charge) : undefined;
     if (fault && fault.retrieveFailures > 0) {
