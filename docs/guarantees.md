@@ -27,7 +27,7 @@ corrobo does not assume failure. It observes the external system. Found → `APP
 It says so: `UNKNOWN` → `INVESTIGATE`, closed, for a person or another process to decide. That's a correct answer, not a failure mode to work around. → rows 2.6, 3.1, 6.4
 
 **What happens when two workers race?**
-With `PostgresStore`, one of them executes; the other gets the current record (or an honest "in progress") without waiting or executing. Different operations don't block each other. If the winner's database connection dies mid-call, version-checked writes stop it from overwriting anything, and the late-landing rule stops anyone from executing again before the declared in-flight window has passed and a re-check still finds nothing. → rows 8.1–8.11
+With `PostgresStore`, one of them executes; the other gets the current record (or an honest "in progress") without waiting for the lock or executing (it does wait for a pool connection if the pool is exhausted; see [operations](operations.md#set-up-the-pool)). Different operations don't block each other. If the winner's database connection dies mid-call, version-checked writes stop it from overwriting anything, and the late-landing rule stops anyone from executing again before the declared in-flight window has passed and a re-check still finds nothing. → rows 8.1–8.11
 
 **What happens after a crash?**
 The attempt was recorded before `execute()` ran, so the restart knows it was attempted. It observes first: `APPLIED` finishes it; `NOT_APPLIED` follows the late-landing rule; `UNKNOWN` goes to a person. With `InMemoryStore`, a restart loses everything, so use `PostgresStore` wherever that matters. → rows 2.1–2.9

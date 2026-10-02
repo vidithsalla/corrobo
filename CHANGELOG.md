@@ -14,6 +14,7 @@
 
 ### Added
 
+- **[Running corrobo in production](docs/operations.md):** pool setup (including the `pool.on("error")` handler node-postgres needs to survive a failover), timeouts for every hook, migrations with a lock timeout, upgrades (no rolling back to 0.4.0), retention (deleting a row lets its identity execute again), and SQL that finds operations needing a call, each query run against Postgres in CI. The docs no longer claim lock acquisition never waits: it can wait for a pool connection. From an adversarial operator review.
 - **A model-based test of the review flow** (`tests/review-state-machine.test.ts`). It runs random sequences of runs, review decisions (current, stale, foreign and garbage tokens, decisions dated before the review, expiries), `revalidate()` outcomes, transport outcomes, late landings, clock jumps, crashes at store writes, lock contention and 0.4.0 workers in a rolling upgrade, in memory and against Postgres. It checks every `execute()` and every decision against an independent oracle. Its oracle is built from the test's own inputs, never from corrobo's record. `npm run mutations:review` reintroduces 32 known review-flow bugs one at a time (the original stale-review bug, every fix since, and the gaps an adversarial review of the test itself found); the model catches all of them. Scale it with `CORROBO_MODEL_SEEDS` / `CORROBO_MODEL_STEPS`; re-run one seed with `CORROBO_MODEL_SEED`.
 
 ## 0.5.0 — 2026-10-02
