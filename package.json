@@ -80,6 +80,7 @@
     "example:jev": "tsx examples/jev-refund/demo.ts",
     "example:jev:live": "tsx examples/jev-refund/live.ts",
     "example:action-table": "tsx examples/action-table/demo.ts",
+    "mutations:review": "node scripts/review-mutations.mjs",
     "verify": "npm run typecheck && npm run test && npm run build"
   },
   "devDependencies": {

@@ -160,7 +160,21 @@ export interface ReviewEpisode {
   generation: number;
   /** When this review began, from the store's clock. A decision dated earlier was made for something else. */
   openedAt: string;
+  /**
+   * A decision without a token (recorded by corrobo 0.4.0) that was on record when this review
+   * opened. It is moved here, out of OperationRecord.review, because it predates this review and
+   * never answers it; kept for the audit trail. Any tokenless decision on the record after that
+   * was written later, so it answers this review.
+   */
+  supersededDecision?: TokenlessReview;
 }
+
+/** A decision recorded by corrobo 0.4.0, which kept no review token (or reviewer, or attempt count, in some records). */
+export type TokenlessReview = Omit<RecordedReview, "reviewToken" | "reviewer" | "attemptCount"> & {
+  reviewToken?: undefined;
+  reviewer: string | null;
+  attemptCount?: number;
+};
 
 /** What reviewEffect() takes: which operation, and the reviewer's decision on it. */
 export interface ReviewRequest {

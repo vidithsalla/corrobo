@@ -21,6 +21,7 @@ import type {
   ReviewDecision,
   ReviewEpisode,
   ReviewRequest,
+  TokenlessReview,
   ReservedAttempt,
   ResolvedAttempt,
   TransportOutcome
@@ -168,14 +169,13 @@ function openReview(record: OperationRecord): ReviewEpisode | null {
   const episode = record.reviewEpisode;
   if (record.status !== "AWAITING_REVIEW" || !episode) return null;
   const review = record.review;
-  // Answered: a decision carries this episode's token; or, for a decision without a token (only
-  // corrobo 0.4.0 records those), it was recorded once this episode was open (both read the
-  // store's clock; a tie counts as answered, which only costs a new review, never a reused one).
+  // Answered: a decision carries this episode's token; or a decision without a token is on
+  // record. Only corrobo 0.4.0 records those, and corrobo moves any that is on record when it
+  // opens a review out of the way (ReviewEpisode.supersededDecision), so one that's here now was
+  // written after this review opened. (A record from 0.5.0, which didn't move them, at worst
+  // gets one extra new review; a used-up token never counts.)
   const answered =
-    review !== undefined &&
-    (typeof review.reviewToken === "string"
-      ? review.reviewToken === episode.token
-      : Date.parse(review.recordedAt) >= Date.parse(episode.openedAt));
+    review !== undefined && (typeof review.reviewToken === "string" ? review.reviewToken === episode.token : true);
   return answered ? null : episode;
 }
 
@@ -195,7 +195,8 @@ async function openReviewEpisode(
   store: CoordinatedStore,
   identity: OperationIdentity,
   intentFingerprint: string,
-  previous: ReviewEpisode | undefined
+  previous: ReviewEpisode | undefined,
+  decisionOnRecord?: RecordedReview
 ): Promise<ReviewEpisode> {
   const generation = (previous?.generation ?? 0) + 1;
   const openedAt = await safetyNow(store);
@@ -205,7 +206,16 @@ async function openReviewEpisode(
     )
     .digest("hex")
     .slice(0, 32);
-  return { token, generation, openedAt };
+  const episode: ReviewEpisode = { token, generation, openedAt };
+  if (decisionOnRecord && typeof decisionOnRecord.reviewToken !== "string") {
+    episode.supersededDecision = decisionOnRecord as unknown as TokenlessReview;
+  }
+  return episode;
+}
+
+/** Writing a new review: a tokenless decision it supersedes moves into it (see openReview). */
+function reviewEpisodeUpdate(reviewEpisode: ReviewEpisode): { reviewEpisode: ReviewEpisode; review?: null } {
+  return reviewEpisode.supersededDecision ? { reviewEpisode, review: null } : { reviewEpisode };
 }
 
 const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/i;
@@ -815,14 +825,14 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
     result.outcome === "requiresReview" ? "AWAITING_REVIEW" : result.outcome === "reject" ? "CLOSED" : undefined;
   const reviewEpisode =
     result.outcome === "requiresReview"
-      ? await openReviewEpisode(store, base.identity, fingerprintIntent(contract, record.intent), record.reviewEpisode)
+      ? await openReviewEpisode(store, base.identity, fingerprintIntent(contract, record.intent), record.reviewEpisode, record.review)
       : undefined;
   const updated = await store.updateOperation(
     base.identity.id,
     {
       blockedBy,
       ...(status ? { status } : {}),
-      ...(reviewEpisode ? { reviewReason: result.reason, reviewEpisode } : {})
+      ...(reviewEpisode ? { reviewReason: result.reason, ...reviewEpisodeUpdate(reviewEpisode) } : {})
     },
     base.version
   );
@@ -1095,9 +1105,10 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
         store,
         existing.identity,
         fingerprintIntent(contract, existing.intent),
-        existing.reviewEpisode
+        existing.reviewEpisode,
+        existing.review
       );
-      return resultFromRecord(await store.updateOperation(existing.identity.id, { reviewEpisode }, existing.version));
+      return resultFromRecord(await store.updateOperation(existing.identity.id, reviewEpisodeUpdate(reviewEpisode), existing.version));
     }
     return resultFromRecord(existing);
   }
