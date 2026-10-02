@@ -454,7 +454,7 @@ describe("approvals are checked before every attempt", () => {
           expiresAt: store.iso(1_000),
           intentFingerprint: fingerprintIntent(contract, intent),
           recordedAt: store.iso(),
-          reviewToken: "t",
+          reviewToken: record!.reviewEpisode!.token,
           attemptCount: 0
         }
       },
@@ -795,5 +795,76 @@ describe("review tokens: a decision answers one review", () => {
     });
     expect((await runEffect(store, contract, { identity: "t3", intent })).disposition).toBe("COMPLETE");
     expect(ledger.count("t3")).toBe(1);
+  });
+
+  it("an approval recorded without a token (corrobo 0.4.0) isn't honored after upgrading: a new review opens", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = makeContract(ledger);
+    const waiting = await runEffect(store, contract, { identity: "t4", intent });
+    const record = await store.getOperation("t4");
+    // What 0.4.0 left: approved, OPEN, a reviewer, no reviewToken (and, here, no episode either).
+    await store.updateOperation(
+      "t4",
+      {
+        status: "OPEN",
+        reviewEpisode: null,
+        review: {
+          decision: "approved",
+          reviewer: "A",
+          decidedAt: store.iso(),
+          intentFingerprint: fingerprintIntent(contract, intent),
+          recordedAt: store.iso(),
+          attemptCount: 0
+        } as unknown as RecordedReview
+      },
+      record!.version
+    );
+    const result = await runEffect(store, contract, { identity: "t4", intent });
+    expect(result).toMatchObject({ status: "AWAITING_REVIEW", dispositionReason: { code: "APPROVAL_NOT_RECORDED" } });
+    expect(result.reviewToken).toMatch(/^[0-9a-f]{32}$/);
+    expect(result.reviewToken).not.toBe(waiting.reviewToken);
+    expect(ledger.credits).toEqual([]);
+  });
+
+  it("a review already answered can't be answered again, even if the operation is put back to review without a new one", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = makeContract(ledger);
+    const first = await runEffect(store, contract, { identity: "t5", intent });
+    ledger.respondNotAppliedOnce();
+    await reviewEffect(store, contract, {
+      identity: "t5",
+      decision: { decision: "approved", reviewer: "B", reviewToken: first.reviewToken! }
+    });
+    await runEffect(store, contract, { identity: "t5", intent }); // attempt 1: not applied
+
+    // A 0.4.0 worker sends it back to review, leaving the answered episode in place.
+    const record = await store.getOperation("t5");
+    await store.updateOperation(
+      "t5",
+      { status: "AWAITING_REVIEW", reviewReason: { code: "OLD_WORKER", summary: "look again" } },
+      record!.version
+    );
+    expect((await store.getOperation("t5"))?.reviewEpisode?.token).toBe(first.reviewToken);
+
+    // Before runEffect() opens a new review, the answered token is refused...
+    await expect(
+      reviewEffect(store, contract, {
+        identity: "t5",
+        decision: { decision: "approved", reviewer: "A", reviewToken: first.reviewToken! }
+      })
+    ).rejects.toMatchObject({ code: "STALE_REVIEW_TOKEN" });
+    // ...and runEffect() opens a new one, whose token is the only one that counts.
+    const reopened = await runEffect(store, contract, { identity: "t5", intent });
+    expect(reopened.reviewToken).not.toBe(first.reviewToken);
+    expect((await store.getOperation("t5"))?.reviewEpisode?.generation).toBe(2);
+    await expect(
+      reviewEffect(store, contract, {
+        identity: "t5",
+        decision: { decision: "approved", reviewer: "A", reviewToken: first.reviewToken! }
+      })
+    ).rejects.toMatchObject({ code: "STALE_REVIEW_TOKEN" });
+    expect(ledger.credits).toEqual([]);
   });
 });

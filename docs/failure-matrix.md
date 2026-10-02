@@ -102,6 +102,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 7.27 | Approved (separately) after an attempt that got a not-applied response | The next `runEffect()` re-observes that attempt first (also if the review record lacks its attempt count); an effect that appeared during the wait is `COMPLETE` | No | T155, T158 |
 | 7.28 | A decision made on an earlier review's screen arrives after the operation went to review again | Refused (`ReviewNotAcceptedError`, `STALE_REVIEW_TOKEN`); a decision dated before the current review began is refused too (`DECIDED_BEFORE_REVIEW_OPENED`) | No | T160, T161 |
 | 7.29 | Each review of an operation | New token and generation each time (including after an expired approval); a token from another operation is refused; operations that awaited review before tokens existed get one on their next `runEffect()`; survives a restart | — | T162, T163, T164, T165, T166 |
+| 7.31 | Upgrading from 0.4.0: an approval it recorded (no token), or an operation a 0.4.0 worker sent back to review without a new review | The approval isn't honored (`APPROVAL_NOT_RECORDED`, new review); the already-answered token is refused and the next `runEffect()` opens a new review | No | T171, T172 |
 
 ## 8. Concurrency and lock loss
 
@@ -343,4 +344,6 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T164** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an operation that went to review before tokens existed gets one on its next runEffect()"
 - **T165** [`tests/postgres-review.test.ts`](../tests/postgres-review.test.ts) — "review tokens persist: minted at creation, read back by another process, and a stale one is refused there"
 - **T166** [`tests/postgres-review.test.ts`](../tests/postgres-review.test.ts) — "migrate() adds review_episode to an older table; a row awaiting review there gets a token on its next run"
+- **T171** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval recorded without a token (corrobo 0.4.0) isn't honored after upgrading: a new review opens"
+- **T172** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review already answered can't be answered again, even if the operation is put back to review without a new one"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"

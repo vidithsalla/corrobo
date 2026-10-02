@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { decideDisposition } from "./disposition";
 import type { DecideDispositionResult } from "./disposition";
 import { canonicalStringify, fingerprintIntent, materializeIntent } from "./fingerprint";
@@ -158,15 +158,29 @@ export class ReviewNotAcceptedError extends Error {
   }
 }
 
-/** The token a decision must carry right now: only while the operation awaits review. */
+/**
+ * The review a decision can answer right now: the operation awaits review and its episode hasn't
+ * been answered yet. An episode a recorded decision already answered is used up (e.g. a 0.4.0
+ * worker sent the operation back to review without opening a new one); its token never counts
+ * again, and runEffect() opens a new review instead.
+ */
+function openReview(record: OperationRecord): ReviewEpisode | null {
+  const episode = record.reviewEpisode;
+  if (record.status !== "AWAITING_REVIEW" || !episode) return null;
+  return record.review?.reviewToken === episode.token ? null : episode;
+}
+
+/** The token a decision must carry right now (see openReview), or null. */
 function currentReviewToken(record: OperationRecord): string | null {
-  return record.status === "AWAITING_REVIEW" ? (record.reviewEpisode?.token ?? null) : null;
+  return openReview(record)?.token ?? null;
 }
 
 /**
  * Begins a new review of this operation. The token is a digest of the operation, this review's
- * generation and start time, and the recorded intent's fingerprint: not a secret (it doesn't
- * authenticate anyone), just a binding, so a decision made for one review can't answer another.
+ * generation and start time, the recorded intent's fingerprint and a random nonce, so no two
+ * reviews ever share one (even if a store lost the previous episode). It isn't a secret (it
+ * doesn't authenticate anyone); it's a binding, so a decision made for one review can't answer
+ * another.
  */
 async function openReviewEpisode(
   store: CoordinatedStore,
@@ -177,7 +191,9 @@ async function openReviewEpisode(
   const generation = (previous?.generation ?? 0) + 1;
   const openedAt = await safetyNow(store);
   const token = createHash("sha256")
-    .update(JSON.stringify([identity.operationType, identity.id, generation, openedAt, intentFingerprint]))
+    .update(
+      JSON.stringify([identity.operationType, identity.id, generation, openedAt, intentFingerprint, randomBytes(16).toString("hex")])
+    )
     .digest("hex")
     .slice(0, 32);
   return { token, generation, openedAt };
@@ -713,15 +729,19 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
     version: record.version,
     attemptNumber: record.attempts.length + 1
   };
-  // An approval counts only with a recorded reviewer.
+  // An approval counts only with a recorded reviewer, given for the operation's current review
+  // (its token is that review's). One without (recorded by corrobo 0.4.0, which kept no tokens,
+  // or by a store that dropped them) fails closed below.
   const attributed =
     record.review?.decision === "approved" &&
     typeof record.review.reviewer === "string" &&
-    record.review.reviewer.trim() !== "";
+    record.review.reviewer.trim() !== "" &&
+    typeof record.review.reviewToken === "string" &&
+    record.review.reviewToken === record.reviewEpisode?.token;
   const approval = attributed ? { ...record.review! } : null;
   // Left review (it has a review reason) without an attributed approval on record: approved by
-  // corrobo 0.3.x, which kept no record of who approved what, or a record missing its reviewer.
-  // Fail closed: it needs a fresh review.
+  // corrobo 0.3.x or 0.4.0, or a record missing its reviewer or token. Fail closed: it needs a
+  // fresh review.
   const unrecordedApproval = !approval && record.reviewReason !== undefined;
   if (!contract.revalidate && !approval && !unrecordedApproval) {
     return performAttempt(store, contract, base, request.intent);
@@ -948,7 +968,7 @@ export async function reviewEffect<Intent, Observation, Evidence, Context = unkn
     const refuse = (code: ReviewRefusal, message: string): never => {
       throw new ReviewNotAcceptedError(identity.id, code, message, resultFromRecord(existing));
     };
-    const episode = existing.reviewEpisode;
+    const episode = openReview(existing);
     if (existing.status !== "AWAITING_REVIEW") {
       refuse("NOT_AWAITING_REVIEW", `it is ${existing.status}, not awaiting review; see error.current.`);
     }
@@ -1030,10 +1050,16 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
 
   if (existing.status === "AWAITING_REVIEW") {
     // Decisions are recorded by reviewEffect(); until one is, nothing happens here. An operation
-    // that went to review before corrobo kept review episodes (0.4.0 and earlier) gets one now,
-    // so a decision on it has a token to carry.
-    if (!existing.reviewEpisode) {
-      const reviewEpisode = await openReviewEpisode(store, existing.identity, fingerprintIntent(contract, existing.intent), undefined);
+    // awaiting review without an open episode gets a new one now, so a decision has a current
+    // token to carry: it went to review before corrobo kept episodes (0.4.0 and earlier), or its
+    // episode was already answered (a 0.4.0 worker sent it back to review without opening one).
+    if (!openReview(existing)) {
+      const reviewEpisode = await openReviewEpisode(
+        store,
+        existing.identity,
+        fingerprintIntent(contract, existing.intent),
+        existing.reviewEpisode
+      );
       return resultFromRecord(await store.updateOperation(existing.identity.id, { reviewEpisode }, existing.version));
     }
     return resultFromRecord(existing);
