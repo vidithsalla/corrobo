@@ -81,7 +81,8 @@ export class FakeStripeClient implements StripeClientLike {
       opts: { idempotencyKey: string }
     ): Promise<RefundLike> => this.doCreate(params, opts.idempotencyKey),
     retrieve: (id: string): Promise<RefundLike> => this.doRetrieve(id),
-    list: (params: { charge: string; limit?: number }): Promise<{ data: RefundLike[] }> => this.doList(params)
+    list: (params: { charge: string; limit?: number; starting_after?: string }): Promise<{ data: RefundLike[]; has_more: boolean }> =>
+      this.doList(params)
   };
 
   /** How many read calls (retrieve + list) were made. Reads never create anything. For test assertions. */
@@ -154,15 +155,17 @@ export class FakeStripeClient implements StripeClientLike {
     return refund;
   }
 
-  private async doList(params: { charge: string; limit?: number }): Promise<{ data: RefundLike[] }> {
+  private async doList(params: { charge: string; limit?: number; starting_after?: string }): Promise<{ data: RefundLike[]; has_more: boolean }> {
     this.reads += 1;
     const fault = this.faults.get(params.charge);
     if (fault && fault.listFailures > 0) {
       fault.listFailures -= 1;
       throw new Error("simulated network failure during list");
     }
-    const data = [...this.byId.values()].filter((r) => r.charge === params.charge).slice(0, params.limit ?? 10);
-    return { data };
+    const all = [...this.byId.values()].filter((r) => r.charge === params.charge);
+    const from = params.starting_after ? all.findIndex((r) => r.id === params.starting_after) + 1 : 0;
+    const limit = params.limit ?? 10;
+    return { data: all.slice(from, from + limit), has_more: from + limit < all.length };
   }
 
   private async doRetrieve(id: string): Promise<RefundLike> {

@@ -164,7 +164,7 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 | # | Situation | Behavior | Proof |
 |---|---|---|---|
 | 11.1 | Provider idempotency key | Same key on every attempt of one operation; a new operation never reuses it | T92, T93 |
-| 11.2 | A lost response, or a re-check long after the attempt (past the key's retention, e.g. Stripe's ~24h) | The read-back finds the refund by the operation id the request carried in its metadata, so it never relies on the key's retention; the request is only re-sent by a retry, with the same key | T94 |
+| 11.2 | A lost response, or a re-check long after the attempt (past the key's retention, e.g. Stripe's ~24h) | The read-back finds the refund by the operation id the request carried in its metadata, so it never relies on the key's retention; the request is only re-sent by a retry, with the same key | T94, T184 |
 | 11.3 | Stable provider id known from `execute()` | Later checks look it up directly | T95 |
 | 11.4 | Lookup only by search/listing | **Assumes:** your contract returns `UNKNOWN` when absence can't be proven — see 3.4 | T30 |
 | 11.5 | An `observe()` that could create the effect (e.g. replaying the create request as its "read-back") | Not allowed: `observe()` runs where nothing may execute (crash recovery, re-checks, after an approval expired), so it must only read. The Stripe example reads only; an expired approval leads to review, not a refund | T181 |
@@ -367,5 +367,6 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T181** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "observe() never creates a refund: an approval that expired while the request was lost leads to review, not a refund"
 - **T182** [`tests/observation-history.test.ts`](../tests/observation-history.test.ts) — "a long PENDING keeps the first observation and the most recent ones, at most 20"
 - **T183** [`tests/observation-history.test.ts`](../tests/observation-history.test.ts) — "is bounded and persisted, and read back by another process"
+- **T184** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "the read-back pages through a charge's refunds: ours behind 150 others is still found"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"
