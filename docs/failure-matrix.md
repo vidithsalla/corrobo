@@ -102,6 +102,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 7.27 | Approved (separately) after an attempt that got a not-applied response | The next `runEffect()` re-observes that attempt first (also if the review record lacks its attempt count); an effect that appeared during the wait is `COMPLETE` | No | T155, T158 |
 | 7.28 | A decision made on an earlier review's screen arrives after the operation went to review again | Refused (`ReviewNotAcceptedError`, `STALE_REVIEW_TOKEN`); a decision dated before the current review began is refused too (`DECIDED_BEFORE_REVIEW_OPENED`) | No | T160, T161 |
 | 7.29 | Each review of an operation | New token and generation each time (including after an expired approval); a token from another operation is refused; operations that awaited review before tokens existed get one on their next `runEffect()`; survives a restart | — | T162, T163, T164, T165, T166 |
+| 7.30 | The contract sets `maxApprovalAgeMs` | An approval stops covering attempts that much time after it was decided (or recorded, if earlier), with or without its own `expiresAt` (the earlier wins); already too old on arrival: refused; aged out before an attempt: `AWAITING_REVIEW` with `APPROVAL_EXPIRED` | Not until re-approved | T167, T168, T169, T170 |
 | 7.31 | Upgrading from 0.4.0: an approval it recorded (no token), or an operation a 0.4.0 worker sent back to review without a new review | The approval isn't honored (`APPROVAL_NOT_RECORDED`, new review); the already-answered token is refused and the next `runEffect()` opens a new review | No | T171, T172, T173 |
 
 ## 8. Concurrency and lock loss
@@ -347,4 +348,8 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T171** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval recorded without a token (corrobo 0.4.0) isn't honored after upgrading: a new review opens"
 - **T172** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review already answered can't be answered again, even if the operation is put back to review without a new one"
 - **T173** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review a 0.4.0 worker answered (no token) and then reopened can't be answered with its old token"
+- **T167** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval without expiresAt stops covering attempts once it is older than maxApprovalAgeMs"
+- **T168** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "the earlier of expiresAt and maxApprovalAgeMs wins, and age counts from decidedAt when that is earlier"
+- **T169** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval already older than maxApprovalAgeMs when it arrives is refused"
+- **T170** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "within maxApprovalAgeMs the approval works as usual; an invalid maxApprovalAgeMs fails closed"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"
