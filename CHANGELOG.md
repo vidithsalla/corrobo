@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A new review could have no token for a moment during an upgrade from 0.4.0.** If a 0.4.0 worker had approved an operation (recording no token) and 0.5.0 opened a new review for it in the same millisecond, that review counted as already answered: the result reported `AWAITING_REVIEW` with `reviewToken: null` until the next `runEffect()`. That's fail-closed (nothing could be approved or executed), but it's wrong. A review now records the tokenless decision that predates it (`ReviewEpisode.predatesDecisionAt`). Found by the new model-based test.
+
+### Added
+
+- **A model-based test of the review flow** (`tests/review-state-machine.test.ts`). It runs random sequences of runs, review decisions (current, stale, foreign and garbage tokens, decisions dated before the review, expiries), `revalidate()` outcomes, transport outcomes, late landings, clock jumps, crashes at store writes, lock contention and 0.4.0 workers in a rolling upgrade, in memory and against Postgres. It checks every `execute()` and every decision against an independent oracle. It caught all 14 deliberately reintroduced bugs, including the original stale-review bug. Scale it with `CORROBO_MODEL_SEEDS` / `CORROBO_MODEL_STEPS`; re-run one seed with `CORROBO_MODEL_SEED`.
+
 ## 0.5.0 — 2026-10-02
 
 Fixes a review-boundary bug in 0.4.0: a decision made for one review of an operation could approve a later review of it. Each review now has its own token, and decisions are refused unless they carry the current one. Also adds `maxApprovalAgeMs` and corrects what the docs claim about the `runEffect()`/`reviewEffect()` split. Upgrade from 0.4.0 if you use review.

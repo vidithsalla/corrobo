@@ -170,12 +170,14 @@ function openReview(record: OperationRecord): ReviewEpisode | null {
   const review = record.review;
   // Answered: a decision carries this episode's token; or, for a decision without a token (only
   // corrobo 0.4.0 records those), it was recorded once this episode was open (both read the
-  // store's clock; a tie counts as answered, which only costs a new review, never a reused one).
+  // store's clock; a tie counts as answered, which only costs a new review, never a reused one)
+  // and isn't the decision that was already on record when this episode opened.
   const answered =
     review !== undefined &&
     (typeof review.reviewToken === "string"
       ? review.reviewToken === episode.token
-      : Date.parse(review.recordedAt) >= Date.parse(episode.openedAt));
+      : review.recordedAt !== episode.predatesDecisionAt &&
+        Date.parse(review.recordedAt) >= Date.parse(episode.openedAt));
   return answered ? null : episode;
 }
 
@@ -195,7 +197,8 @@ async function openReviewEpisode(
   store: CoordinatedStore,
   identity: OperationIdentity,
   intentFingerprint: string,
-  previous: ReviewEpisode | undefined
+  previous: ReviewEpisode | undefined,
+  decisionOnRecord?: RecordedReview
 ): Promise<ReviewEpisode> {
   const generation = (previous?.generation ?? 0) + 1;
   const openedAt = await safetyNow(store);
@@ -205,7 +208,11 @@ async function openReviewEpisode(
     )
     .digest("hex")
     .slice(0, 32);
-  return { token, generation, openedAt };
+  const episode: ReviewEpisode = { token, generation, openedAt };
+  if (decisionOnRecord && typeof decisionOnRecord.reviewToken !== "string") {
+    episode.predatesDecisionAt = decisionOnRecord.recordedAt;
+  }
+  return episode;
 }
 
 const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/i;
@@ -815,7 +822,7 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
     result.outcome === "requiresReview" ? "AWAITING_REVIEW" : result.outcome === "reject" ? "CLOSED" : undefined;
   const reviewEpisode =
     result.outcome === "requiresReview"
-      ? await openReviewEpisode(store, base.identity, fingerprintIntent(contract, record.intent), record.reviewEpisode)
+      ? await openReviewEpisode(store, base.identity, fingerprintIntent(contract, record.intent), record.reviewEpisode, record.review)
       : undefined;
   const updated = await store.updateOperation(
     base.identity.id,
@@ -1095,7 +1102,8 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
         store,
         existing.identity,
         fingerprintIntent(contract, existing.intent),
-        existing.reviewEpisode
+        existing.reviewEpisode,
+        existing.review
       );
       return resultFromRecord(await store.updateOperation(existing.identity.id, { reviewEpisode }, existing.version));
     }

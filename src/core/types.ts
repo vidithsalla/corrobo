@@ -160,6 +160,12 @@ export interface ReviewEpisode {
   generation: number;
   /** When this review began, from the store's clock. A decision dated earlier was made for something else. */
   openedAt: string;
+  /**
+   * Set when this review opened while a decision without a token (recorded by corrobo 0.4.0)
+   * was on record: that decision's recordedAt. That decision predates this review, so it never
+   * counts as answering it, even if both share a timestamp.
+   */
+  predatesDecisionAt?: string;
 }
 
 /** What reviewEffect() takes: which operation, and the reviewer's decision on it. */

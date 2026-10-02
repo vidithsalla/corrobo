@@ -989,4 +989,38 @@ describe("maxApprovalAgeMs: approvals age out", () => {
     ).rejects.toThrow(/maxApprovalAgeMs/);
     expect(ledger.count("g5")).toBe(0);
   });
+
+  it("a review opened in the same millisecond a 0.4.0 approval was recorded still has a usable token (found by the model test)", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = makeContract(ledger);
+    await runEffect(store, contract, { identity: "t7", intent });
+    const record = await store.getOperation("t7");
+    // A 0.4.0 worker approves without a token at time T...
+    await store.updateOperation(
+      "t7",
+      {
+        status: "OPEN",
+        review: {
+          decision: "approved",
+          reviewer: "legacy",
+          decidedAt: store.iso(),
+          intentFingerprint: fingerprintIntent(contract, intent),
+          recordedAt: store.iso(),
+          attemptCount: 0
+        } as unknown as RecordedReview
+      },
+      record!.version
+    );
+    // ...and 0.5 refuses it and opens a new review, also at time T.
+    const waiting = await runEffect(store, contract, { identity: "t7", intent });
+    expect(waiting).toMatchObject({ status: "AWAITING_REVIEW", dispositionReason: { code: "APPROVAL_NOT_RECORDED" } });
+    expect(waiting.reviewToken).toMatch(/^[0-9a-f]{32}$/);
+    await reviewEffect(store, contract, {
+      identity: "t7",
+      decision: { decision: "approved", reviewer: "A", reviewToken: waiting.reviewToken! }
+    });
+    expect((await runEffect(store, contract, { identity: "t7", intent })).disposition).toBe("COMPLETE");
+    expect(ledger.count("t7")).toBe(1);
+  });
 });
