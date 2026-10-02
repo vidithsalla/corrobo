@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-10-02
+
+Fixes a review-boundary bug in 0.4.0: a decision made for one review of an operation could approve a later review of it. Each review now has its own token, and decisions are refused unless they carry the current one. Also adds `maxApprovalAgeMs` and corrects what the docs claim about the `runEffect()`/`reviewEffect()` split. Upgrade from 0.4.0 if you use review.
 
 ### Security
 
@@ -12,7 +14,8 @@
 2. **Approvals recorded by 0.4.0 need a new review.** They carry no token, so they can't be tied to a review, and one may have come in through the bug above. An operation 0.4.0 approved that hasn't finished goes back to `AWAITING_REVIEW` with `APPROVAL_NOT_RECORDED` before any further attempt.
 3. **`ReviewDecision.reviewToken` is required.** Keep `result.reviewToken` from the result that reported `AWAITING_REVIEW` with your review task, and pass it with the decision. An operation already awaiting review gets a token on its next `runEffect()`.
 4. **`reviewEffect()` throws `ReviewNotAcceptedError` instead of returning quietly** when it doesn't record a decision: not awaiting review, a stale token, a decision dated before the review began, a different intent, or an approval that has already expired. `.code` says which, and `.current` is the operation's state. The intent-mismatch and already-expired refusals used to be plain `Error`s.
-5. **New required fields:** `EffectResult.reviewToken` (`string | null`) and `RecordedReview.reviewToken`. Custom stores must persist `OperationRecord.reviewEpisode`, including when an operation is created with one (`NewOperationInput.reviewEpisode`).
+5. **`setStatus()` is still there**, still deprecated. Its removal moves to 0.6, so custom stores and callers get one more release to switch to `updateOperation()`.
+6. **New required fields:** `EffectResult.reviewToken` (`string | null`) and `RecordedReview.reviewToken`. Custom stores must persist `OperationRecord.reviewEpisode`, including when an operation is created with one (`NewOperationInput.reviewEpisode`).
 
 ### Added
 
