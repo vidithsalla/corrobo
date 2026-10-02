@@ -126,8 +126,9 @@ npm install corrobo pg
 import { Pool } from "pg";
 import { PostgresStore } from "corrobo/postgres";
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-await PostgresStore.migrate(pool); // creates (or upgrades) the one table it needs; idempotent
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 5_000 });
+pool.on("error", (err) => console.error("postgres pool error", err)); // an idle client's failover error must not crash the process
+await PostgresStore.migrate(pool); // creates (or upgrades) its table; idempotent. In production, run it as a deploy step with a lock_timeout (docs/operations.md)
 
 const store = new PostgresStore(pool, { acknowledgePersistence: true });
 ```
@@ -135,6 +136,7 @@ const store = new PostgresStore(pool, { acknowledgePersistence: true });
 - **Crash safety:** the attempt is recorded before `execute()` runs, so a restart never mistakes "attempted, outcome unknown" for "never attempted". It checks the external system first.
 - **Concurrency:** callers racing on the same identity are coordinated with a Postgres advisory lock; different identities run in parallel. Each operation in flight holds one pool connection for its whole pass, so size `max` on your `Pool` for the operations you run at once, plus whatever else uses that pool.
 - **Lost locks:** if the lock's connection dies while `execute()` is still running, version-checked writes keep the stale caller from overwriting anything, and the late-landing rule keeps the next caller from re-executing too early. Time windows use the database's clock, so skew between hosts doesn't matter.
+- **Before you run it for real:** [running corrobo in production](docs/operations.md): pool and hook timeouts, migrations, retention (deleting a row lets its identity execute again), and SQL to find operations that need a call.
 - `acknowledgePersistence: true` is required on purpose: this store keeps what your contracts produce, with no automatic expiry (see [privacy](#privacy-and-data-handling)).
 - **Upgrading:** drain workers on the old version first, then run `migrate()` once. From 0.4.0 or 0.3.x it adds nullable columns, and unfinished operations approved by those versions need a new review before any further attempt; see the [changelog](CHANGELOG.md). From 0.2.x, see also the [0.3 upgrade notes](docs/v0.1-spec.md#o-fencing-and-settlement-when-the-lock-is-not-enough).
 

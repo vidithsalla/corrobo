@@ -52,6 +52,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 4.2 | `PENDING` → `APPLIED` | Applied | `APPLIED` → `COMPLETE`, same attempt | No | No | Nothing | T33, T34 |
 | 4.3 | `PENDING` → provider rejected it | Not applied, request finished | `NOT_APPLIED` → `RETRY` per policy (one new attempt), or `INVESTIGATE` if not retryable | Once, if policy allows | No | Nothing / investigate | T35, T36 |
 | 4.4 | Concurrent callers while `PENDING` | In progress | One execution; convergence needs no second one | No | No | Nothing | T37 |
+| 4.5 | Stays `PENDING` for a long time (many polls) | Not final yet | Re-observed on each call, never re-executed; the history keeps the first observation and the most recent ones (at most 20), so the record doesn't grow without limit | No | No | Call again later; escalate if it never settles | T182, T183 |
 
 ## 5. Conflict
 
@@ -364,5 +365,7 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T179** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "is persisted on the attempt and read back by another process"
 - **T180** [`tests/recorded-intent.test.ts`](../tests/recorded-intent.test.ts) — "with a custom fingerprint, a later request can't change what the reviewer approved"
 - **T181** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "observe() never creates a refund: an approval that expired while the request was lost leads to review, not a refund"
+- **T182** [`tests/observation-history.test.ts`](../tests/observation-history.test.ts) — "a long PENDING keeps the first observation and the most recent ones, at most 20"
+- **T183** [`tests/observation-history.test.ts`](../tests/observation-history.test.ts) — "is bounded and persisted, and read back by another process"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"

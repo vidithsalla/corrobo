@@ -575,7 +575,7 @@ function resolveAttempt(
   base: { attemptNumber: number; startedAt: string; check?: PreExecuteCheck; maxInFlightMs?: number },
   transport: TransportOutcome<unknown>,
   observations: ObservationResult<unknown>[],
-  reconciliation: { evidenceState: EvidenceState; reason: ReasonCode },
+  reconciliation: { evidenceState: EvidenceState; reason: ReasonCode; observedEffect?: unknown },
   now: string
 ): ResolvedAttempt {
   const decision = decide(
@@ -608,7 +608,30 @@ function resolveAttempt(
   if (base.maxInFlightMs !== undefined) {
     attempt.maxInFlightMs = base.maxInFlightMs;
   }
+  const observedEffect = jsonCopy(reconciliation.observedEffect);
+  if (observedEffect !== undefined) {
+    attempt.observedEffect = observedEffect;
+  }
   return attempt;
+}
+
+const MAX_OBSERVATIONS = 20;
+
+/** The first observation and the most recent ones, at most MAX_OBSERVATIONS in all. */
+function boundedObservations(observations: ObservationResult<unknown>[]): ObservationResult<unknown>[] {
+  if (observations.length <= MAX_OBSERVATIONS) return observations;
+  return [observations[0], ...observations.slice(observations.length - (MAX_OBSERVATIONS - 1))];
+}
+
+/** A plain-JSON copy of a value, or undefined if it isn't one (or JSON can't represent it). Never throws. */
+function jsonCopy(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? undefined : JSON.parse(json);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -959,7 +982,7 @@ async function reObserve<Intent, Observation, Evidence>(
     contract as EffectContract<unknown, unknown, unknown>,
     latest,
     latest.transport,
-    [...latest.observations, observation as ObservationResult<unknown>],
+    boundedObservations([...latest.observations, observation as ObservationResult<unknown>]),
     reconciliation,
     await safetyNow(store)
   );
