@@ -1025,4 +1025,44 @@ describe("maxApprovalAgeMs: approvals age out", () => {
     expect((await runEffect(store, contract, { identity: "t7", intent })).disposition).toBe("COMPLETE");
     expect(ledger.count("t7")).toBe(1);
   });
+
+  it("a review 0.5.0 opened while a 0.4.0 decision stayed on record gets a new token once; the old one is refused, the new one works", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = makeContract(ledger);
+    const first = await runEffect(store, contract, { identity: "t8", intent });
+    // What 0.5.0 could leave: awaiting review, its episode open, and a tokenless 0.4.0 decision
+    // still in OperationRecord.review (0.5.0 didn't move it out of the way).
+    const record = await store.getOperation("t8");
+    await store.updateOperation(
+      "t8",
+      {
+        review: {
+          decision: "approved",
+          reviewer: "legacy",
+          decidedAt: store.iso(-60_000),
+          intentFingerprint: fingerprintIntent(contract, intent),
+          recordedAt: store.iso(-60_000),
+          attemptCount: 0
+        } as unknown as RecordedReview
+      },
+      record!.version
+    );
+    store.time += 1_000;
+
+    await expect(
+      reviewEffect(store, contract, { identity: "t8", decision: { decision: "approved", reviewer: "A", reviewToken: first.reviewToken! } })
+    ).rejects.toMatchObject({ code: "STALE_REVIEW_TOKEN" });
+    const reopened = await runEffect(store, contract, { identity: "t8", intent });
+    expect(reopened.status).toBe("AWAITING_REVIEW");
+    expect(reopened.reviewToken).toMatch(/^[0-9a-f]{32}$/);
+    expect(reopened.reviewToken).not.toBe(first.reviewToken);
+    const after = await store.getOperation("t8");
+    expect(after?.review).toBeUndefined();
+    expect(after?.reviewEpisode?.supersededDecision).toMatchObject({ reviewer: "legacy" });
+
+    await reviewEffect(store, contract, { identity: "t8", decision: { decision: "approved", reviewer: "A", reviewToken: reopened.reviewToken! } });
+    expect((await runEffect(store, contract, { identity: "t8", intent })).disposition).toBe("COMPLETE");
+    expect(ledger.count("t8")).toBe(1);
+  });
 });

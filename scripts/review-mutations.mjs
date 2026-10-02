@@ -39,6 +39,9 @@ const MUTATIONS = [
   ["C13a attempt doesn't record approval", "src/core/runtime.ts", "    ...(approval ? { approval } : {}),\n    attemptNumber: base.attemptNumber,", "    attemptNumber: base.attemptNumber,"],
   ["C13b attemptCount always 0", "src/core/runtime.ts", "    attemptCount: record.attempts.length", "    attemptCount: 0"],
   ["C14 lock losers lose the token", "src/core/runtime.ts", "    assertSameLogicalOperation(contract, request, prepared, existing);\n    return resultFromRecord(existing);\n  }\n  try {", "    assertSameLogicalOperation(contract, request, prepared, existing);\n    return { ...resultFromRecord(existing), reviewToken: null };\n  }\n  try {"],
+  ["N1 later request changes the executed intent", "src/core/runtime.ts", "  const acting = contract.fingerprintIntent ? { ...request, intent: existing.intent as Intent } : request;", "  const acting = request;"],
+  ["N2 shorter deploy window applies retroactively", "src/core/runtime.ts", "  return whenStarted === undefined ? current : Math.max(current, whenStarted);", "  return current;"],
+  ["N3 window not recorded on the attempt", "src/core/runtime.ts", "    ...(contract.maxInFlightMs !== undefined ? { maxInFlightMs: contract.maxInFlightMs } : {})\n  };\n  const reservedRecord", "  };\n  const reservedRecord"],
 ];
 
 const only = process.argv.slice(2);

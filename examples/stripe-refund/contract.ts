@@ -30,6 +30,9 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/** How many pages of a charge's refunds observe() reads before giving up (100 refunds per page). */
+const MAX_LIST_PAGES = 50;
+
 /** The metadata key each refund carries: the corrobo operation it belongs to. */
 export const OPERATION_METADATA_KEY = "corrobo_operation";
 
@@ -108,7 +111,10 @@ export function createRefundContract(options: {
       // "not applied".
       let ours: RefundLike | undefined;
       let startingAfter: string | undefined;
-      for (;;) {
+      for (let pages = 0; ; pages++) {
+        // A provider (or a bug) that keeps returning has_more would otherwise loop here forever,
+        // holding the operation's lock. Give up loudly: a throw is observation_failed -> UNKNOWN.
+        if (pages >= MAX_LIST_PAGES) throw new Error(`more than ${MAX_LIST_PAGES} pages of refunds on charge ${intent.chargeId}`);
         const page = await options.client.refunds.list({
           charge: intent.chargeId,
           limit: 100,
