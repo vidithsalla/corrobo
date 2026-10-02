@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { Pool } from "pg";
 import { InMemoryStore } from "../src/stores/memory";
+import { PostgresStore } from "../src/stores/postgres";
 import { runEffect, reviewEffect } from "../src/core/runtime";
 import { defineContract, observed, reconciled } from "../src/core/helpers";
 
@@ -135,8 +137,6 @@ const connectionString = process.env.CORROBO_TEST_DATABASE_URL;
 
 describe.skipIf(!connectionString)("settlement window recorded with the attempt (Postgres)", () => {
   it("is persisted on the attempt and read back by another process", async () => {
-    const { Pool } = await import("pg");
-    const { PostgresStore } = await import("../src/stores/postgres");
     const pool = new Pool({ connectionString });
     try {
       await PostgresStore.migrate(pool);
