@@ -65,6 +65,8 @@ async function main() {
 
 `execute()` threw, but corrobo didn't treat that as "not refunded": it asked, found the refund, and finished. Call `runEffect` again with the same store and `identity` (say, from a retry loop) and it returns the recorded result instead of refunding again. A new refund needs a new identity.
 
+`observe()` must only read: corrobo calls it during recovery and re-checks, where nothing may be executed, so it must never be able to create the effect (don't re-send the request from it, even with an idempotency key).
+
 `InMemoryStore` is for trying things out: it forgets everything when the process exits, so a restarted worker would see the refund as new. For anything where a restart or a second worker matters, use [`PostgresStore`](#in-production-postgresstore).
 
 ## Where the identity comes from

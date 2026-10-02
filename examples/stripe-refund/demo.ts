@@ -20,18 +20,23 @@ async function main(): Promise<void> {
   });
   log("normal success -> APPLIED / COMPLETE", { evidenceState: r1.evidenceState, disposition: r1.disposition });
 
-  // 2. Timeout BEFORE Stripe ever processes the request. Unlike a plain REST API with no
-  //    native idempotency, this self-heals in a SINGLE run() call: observe()'s idempotency-key
-  //    replay both discovers nothing was created yet and safely creates it, atomically from
-  //    the caller's point of view.
+  // 2. Timeout BEFORE Stripe ever processes the request. observe() only reads: it lists the
+  //    charge's refunds, finds none tagged with this operation, and reports NOT_APPLIED. The
+  //    next call retries with the SAME idempotency key, so even if the first request were
+  //    still in flight, Stripe would never create a second refund.
   client.seedCharge("ch_2", 5000);
   client.scheduleFault("ch_2", { createFailures: 1, mode: "beforeCommit" });
   const identity2 = { id: "refund-2", operationType: contract.operationType };
   const intent2 = { chargeId: "ch_2", amountCents: 5000 };
   const r2a = await runEffect(store, contract, { identity: identity2, intent: intent2 });
-  log("timeout before Stripe saw the request -> resolved in one call via idempotency replay", {
+  log("timeout before Stripe saw the request -> observe() finds nothing, RETRY", {
     evidenceState: r2a.evidenceState,
     disposition: r2a.disposition
+  });
+  const r2b = await runEffect(store, contract, { identity: identity2, intent: intent2 });
+  log("retry with the same idempotency key -> APPLIED / COMPLETE", {
+    evidenceState: r2b.evidenceState,
+    disposition: r2b.disposition
   });
   console.log(`exactly ${client.createdRefundCount} refund(s) created so far (expect 2: ch_1, ch_2)`);
 
@@ -74,14 +79,14 @@ async function main(): Promise<void> {
     attemptsRecorded: r5b.attempts.length
   });
 
-  // 6. Ambiguous: both the create call and the idempotency-replay observation fail.
+  // 6. Ambiguous: the create call fails and so does the read-back (listing the charge's refunds).
   client.seedCharge("ch_6", 5000);
-  client.scheduleFault("ch_6", { createFailures: 2, mode: "beforeCommit" });
+  client.scheduleFault("ch_6", { createFailures: 1, mode: "beforeCommit", listFailures: 1 });
   const r6 = await runEffect(store, contract, {
     identity: { id: "refund-6", operationType: contract.operationType },
     intent: { chargeId: "ch_6", amountCents: 5000 }
   });
-  log("execute AND the idempotency-replay observation both fail -> UNKNOWN / INVESTIGATE", {
+  log("execute AND the read-back both fail -> UNKNOWN / INVESTIGATE", {
     evidenceState: r6.evidenceState,
     disposition: r6.disposition
   });

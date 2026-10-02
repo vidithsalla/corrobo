@@ -20,6 +20,7 @@ export interface RefundLike {
   status: RefundStatus;
   amount: number;
   charge: string;
+  metadata?: Record<string, string>;
 }
 
 export interface StripeRejection {
@@ -30,10 +31,12 @@ export interface StripeRejection {
 export interface StripeClientLike {
   refunds: {
     create(
-      params: { charge: string; amount: number; reason?: string },
+      params: { charge: string; amount: number; reason?: string; metadata?: Record<string, string> },
       options: { idempotencyKey: string }
     ): Promise<RefundLike>;
     retrieve(id: string): Promise<RefundLike>;
+    /** Refunds on one charge (Stripe's list endpoint, not its eventually consistent Search API). */
+    list(params: { charge: string; limit?: number }): Promise<{ data: RefundLike[] }>;
   };
 }
 
