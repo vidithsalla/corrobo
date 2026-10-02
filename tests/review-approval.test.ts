@@ -982,11 +982,13 @@ describe("maxApprovalAgeMs: approvals age out", () => {
     store.time += 59_000;
     expect((await runEffect(store, contract, { identity: "g4", intent })).disposition).toBe("COMPLETE");
 
+    // An invalid value is refused before anything runs: nothing is recorded or executed.
     const bad = agedContract(ledger, -1);
-    const waitingBad = await runEffect(store, bad, { identity: "g5", intent });
+    await expect(runEffect(store, bad, { identity: "g5", intent })).rejects.toThrow(/maxApprovalAgeMs/);
     await expect(
-      reviewEffect(store, bad, { identity: "g5", decision: { decision: "approved", reviewer: "A", reviewToken: waitingBad.reviewToken! } })
+      reviewEffect(store, bad, { identity: "g4", decision: { decision: "approved", reviewer: "A", reviewToken: "t" } })
     ).rejects.toThrow(/maxApprovalAgeMs/);
+    expect(await store.getOperation("g5")).toBeNull();
     expect(ledger.count("g5")).toBe(0);
   });
 

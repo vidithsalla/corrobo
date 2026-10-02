@@ -333,6 +333,12 @@ export interface ReservedAttempt {
   updatedAt: string;
   /** What was checked before this attempt (see PreExecuteCheck), when anything was. */
   check?: PreExecuteCheck;
+  /**
+   * The contract's maxInFlightMs when this attempt started. Settlement for this attempt never
+   * uses a shorter window, even if a later deploy declares one (a request already in flight
+   * can still take as long as the window it was sent under).
+   */
+  maxInFlightMs?: number;
 }
 
 /** An attempt whose outcome has been established via execute()/observe()/reconcile(). */
@@ -359,6 +365,12 @@ export interface ResolvedAttempt {
   retryNotBefore?: string;
   /** What was checked before this attempt (see PreExecuteCheck), when anything was. */
   check?: PreExecuteCheck;
+  /**
+   * The contract's maxInFlightMs when this attempt started. Settlement for this attempt never
+   * uses a shorter window, even if a later deploy declares one (a request already in flight
+   * can still take as long as the window it was sent under).
+   */
+  maxInFlightMs?: number;
 }
 
 /**
@@ -376,6 +388,8 @@ export interface ReservedAttemptInput {
   startedAt: string;
   /** Must be stored on the reserved attempt when present. */
   check?: PreExecuteCheck;
+  /** Must be stored on the reserved attempt when present (see ReservedAttempt.maxInFlightMs). */
+  maxInFlightMs?: number;
 }
 
 export interface OperationRecord {
