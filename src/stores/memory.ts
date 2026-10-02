@@ -112,7 +112,8 @@ export class InMemoryStore implements EffectStore {
         attemptNumber: reserved.attemptNumber,
         startedAt: reserved.startedAt,
         updatedAt: reserved.startedAt,
-        ...(reserved.check ? { check: reserved.check } : {})
+        ...(reserved.check ? { check: reserved.check } : {}),
+        ...(reserved.maxInFlightMs !== undefined ? { maxInFlightMs: reserved.maxInFlightMs } : {})
       });
     });
   }

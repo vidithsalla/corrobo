@@ -505,7 +505,8 @@ function decide(
   attemptNumber: number,
   transport: TransportOutcome<unknown>,
   attemptStartedAt: string,
-  now: string
+  now: string,
+  windowWhenStarted: number | undefined
 ): DecideDispositionResult {
   return decideDisposition({
     evidenceState,
@@ -515,9 +516,48 @@ function decide(
       transportOk: transport.ok,
       attemptStartedAt,
       now,
-      maxInFlightMs: contract.maxInFlightMs
+      maxInFlightMs: settlementWindow(contract.maxInFlightMs, windowWhenStarted)
     }
   });
+}
+
+/**
+ * The in-flight window to settle an attempt with: the contract's current one, never shorter than
+ * the one the attempt was sent under (a deploy that shortens it must not let an earlier request,
+ * still in flight, be retried early). No current window means none: INVESTIGATE, as declared.
+ */
+function settlementWindow(current: number | undefined, whenStarted: number | undefined): number | undefined {
+  if (current === undefined) return undefined;
+  return whenStarted === undefined ? current : Math.max(current, whenStarted);
+}
+
+/**
+ * Rejects a contract whose settings would make corrobo unsafe or unable to finish, before
+ * anything runs: a negative or non-finite maxInFlightMs (an immediate retry while a request may
+ * still land, or a throw after the effect), a maxAttempts that isn't a positive integer, and so on.
+ */
+function validateContract(contract: EffectContract<any, any, any, any>): void {
+  const fail = (problem: string): never => {
+    throw new TypeError(`corrobo: contract "${String(contract?.operationType)}" ${problem}; nothing was run.`);
+  };
+  if (typeof contract !== "object" || contract === null) fail("is not an object");
+  if (typeof contract.operationType !== "string" || contract.operationType === "") fail("needs a non-empty operationType");
+  for (const hook of ["execute", "observe", "reconcile"] as const) {
+    if (typeof contract[hook] !== "function") fail(`needs ${hook}()`);
+  }
+  for (const hook of ["authorize", "revalidate", "fingerprintIntent"] as const) {
+    if (contract[hook] !== undefined && typeof contract[hook] !== "function") fail(`has a ${hook} that isn't a function`);
+  }
+  const policy = contract.retryPolicy;
+  if (typeof policy !== "object" || policy === null) fail("needs a retryPolicy");
+  if (!Number.isSafeInteger(policy.maxAttempts) || policy.maxAttempts < 1) fail("needs retryPolicy.maxAttempts to be an integer >= 1");
+  if (typeof policy.retryOnNotApplied !== "boolean") fail("needs retryPolicy.retryOnNotApplied to be true or false");
+  for (const field of ["maxInFlightMs", "maxApprovalAgeMs"] as const) {
+    const value = contract[field];
+    if (value !== undefined && !(typeof value === "number" && Number.isFinite(value) && value >= 0)) {
+      fail(`has an invalid ${field} (${String(value)}); it must be a finite number >= 0, or omitted`);
+    }
+  }
 }
 
 /** OPEN while something further is expected (a retry, or convergence); CLOSED otherwise. */
@@ -532,13 +572,21 @@ function statusAfter(evidenceState: EvidenceState, disposition: ResolvedAttempt[
  */
 function resolveAttempt(
   contract: EffectContract<unknown, unknown, unknown>,
-  base: { attemptNumber: number; startedAt: string; check?: PreExecuteCheck },
+  base: { attemptNumber: number; startedAt: string; check?: PreExecuteCheck; maxInFlightMs?: number },
   transport: TransportOutcome<unknown>,
   observations: ObservationResult<unknown>[],
   reconciliation: { evidenceState: EvidenceState; reason: ReasonCode },
   now: string
 ): ResolvedAttempt {
-  const decision = decide(contract, reconciliation.evidenceState, base.attemptNumber, transport, base.startedAt, now);
+  const decision = decide(
+    contract,
+    reconciliation.evidenceState,
+    base.attemptNumber,
+    transport,
+    base.startedAt,
+    now,
+    base.maxInFlightMs
+  );
   const attempt: ResolvedAttempt = {
     status: "RESOLVED",
     attemptNumber: base.attemptNumber,
@@ -556,6 +604,9 @@ function resolveAttempt(
   }
   if (base.check) {
     attempt.check = base.check;
+  }
+  if (base.maxInFlightMs !== undefined) {
+    attempt.maxInFlightMs = base.maxInFlightMs;
   }
   return attempt;
 }
@@ -582,11 +633,13 @@ async function performAttempt<Intent, Observation, Evidence>(
   // expiry is judged at the attempt's start time, not some earlier moment).
   const startedAt = check ? check.checkedAt : await safetyNow(store);
 
-  const reservedRecord = await store.reserveAttempt(
-    identity.id,
-    check ? { attemptNumber, startedAt, check } : { attemptNumber, startedAt },
-    base.version
-  );
+  const reserved = {
+    attemptNumber,
+    startedAt,
+    ...(check ? { check } : {}),
+    ...(contract.maxInFlightMs !== undefined ? { maxInFlightMs: contract.maxInFlightMs } : {})
+  };
+  const reservedRecord = await store.reserveAttempt(identity.id, reserved, base.version);
 
   const transport = await safeExecute(contract, intent, identity, attemptNumber);
   const observation = await safeObserve(contract, intent, identity, transport, startedAt);
@@ -594,7 +647,7 @@ async function performAttempt<Intent, Observation, Evidence>(
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
-    check ? { attemptNumber, startedAt, check } : { attemptNumber, startedAt },
+    reserved,
     transport as TransportOutcome<unknown>,
     [observation as ObservationResult<unknown>],
     reconciliation,
@@ -935,6 +988,7 @@ export async function runEffect<Intent, Observation, Evidence, Context = unknown
   contract: EffectContract<Intent, Observation, Evidence, Context>,
   input: EffectRequest<Intent, Context>
 ): Promise<EffectResult<Observation>> {
+  validateContract(contract);
   const request = resolveRequest(contract as EffectContract<Intent, unknown, unknown, Context>, input);
   // Read the intent once, first. With the default fingerprint, an intent that can't be stored
   // faithfully as JSON is rejected here, before anything else happens — never after an effect.
@@ -995,6 +1049,7 @@ export async function reviewEffect<Intent, Observation, Evidence, Context = unkn
   contract: EffectContract<Intent, Observation, Evidence, Context>,
   request: ReviewRequest
 ): Promise<EffectResult<Observation>> {
+  validateContract(contract);
   const identity = resolveIdentity(contract as EffectContract<unknown, unknown, unknown>, request?.identity);
   const decision = parseReviewDecision(request?.decision);
   const lock = await store.tryAcquireLock(identity.id);

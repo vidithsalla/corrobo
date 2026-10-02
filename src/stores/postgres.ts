@@ -232,7 +232,8 @@ async function reserveAttemptImpl(
     attemptNumber: reserved.attemptNumber,
     startedAt: reserved.startedAt,
     updatedAt: reserved.startedAt,
-    ...(reserved.check ? { check: reserved.check } : {})
+    ...(reserved.check ? { check: reserved.check } : {}),
+    ...(reserved.maxInFlightMs !== undefined ? { maxInFlightMs: reserved.maxInFlightMs } : {})
   };
   const result = await q.query<Row>(
     `UPDATE ${TABLE} SET attempts = attempts || $2::jsonb, updated_at = now(), version = version + 1

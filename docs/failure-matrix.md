@@ -33,6 +33,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 2.7 | `execute()` succeeds but returns data the store can't serialize (e.g. circular SDK object in Postgres) | Effect applied | That pass throws; the reservation survives; the next run observes: `APPLIED` → `COMPLETE` | No | No | Run again; return plain data from `execute()` | T23 |
 | 2.8 | Process restart with `PostgresStore` | — | Operation, intent and evidence reload from Postgres | — | — | Nothing | T24, T34 |
 | 2.9 | Process restart with `InMemoryStore` | — | Every record is gone; corrobo no longer knows the operation was attempted | Yes — it looks new | **Yes** | Use `PostgresStore` wherever a restart matters | T101 |
+| 2.10 | Crash mid-attempt, then a deploy shortens `maxInFlightMs` before recovery | The crashed request can still land within the window it was sent under | The attempt records the window it was sent under; recovery never settles it with a shorter one, so the retry waits for the original window and the re-check then finds a late landing | Not before the original window | No | Run again | T177 |
 
 ## 3. Observation failures
 
@@ -68,6 +69,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 6.3 | Operation type not declared retryable | `INVESTIGATE` | No | T44 |
 | 6.4 | `UNKNOWN`, `PENDING`, `CONFLICTED`, `APPLIED` | Never `RETRY`, whatever the retry policy | No | T45, T102, T103, T104 |
 | 6.5 | Called again after the operation closed | Recorded result returned | No | T46, T100 |
+| 6.6 | Contract settings that would be unsafe or unfinishable (`maxInFlightMs` negative, NaN or infinite; `maxAttempts` not a positive integer; …) | `TypeError` before anything runs: no record, no `execute()` | No | T178, T179 |
 
 ## 7. Review
 
@@ -355,5 +357,8 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T170** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "within maxApprovalAgeMs the approval works as usual; an invalid maxApprovalAgeMs fails closed"
 - **T174** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review opened in the same millisecond a 0.4.0 approval was recorded still has a usable token (found by the model test)"
 - **T175** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 400 random seeds of 60 steps (CORROBO_MODEL_SEEDS for more)"
+- **T177** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "a deploy that shortens maxInFlightMs doesn't let an attempt sent under the longer window be retried early"
+- **T178** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "%s is refused before anything runs"
+- **T179** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "is persisted on the attempt and read back by another process"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"
