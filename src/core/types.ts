@@ -64,6 +64,11 @@ export interface RetryPolicy {
 export interface ReconciliationResult {
   evidenceState: EvidenceState;
   reason: ReasonCode;
+  /**
+   * What reconcile() found, for the record (a receipt, the refund it located). Stored on the
+   * attempt (ResolvedAttempt.observedEffect) when it's JSON-serializable; otherwise left out,
+   * never failing the pass.
+   */
   observedEffect?: unknown;
 }
 
@@ -353,8 +358,14 @@ export interface ResolvedAttempt {
   startedAt: string;
   updatedAt: string;
   transport: TransportOutcome<unknown>;
-  /** More than one entry only when re-observed while evidenceState was PENDING. */
+  /**
+   * More than one entry only when re-observed (while PENDING, or settling before a retry). Kept
+   * bounded: the first observation and the most recent ones (at most 20 in all), so an
+   * operation that stays PENDING for a long time doesn't grow its record without limit.
+   */
   observations: ObservationResult<unknown>[];
+  /** reconcile()'s observedEffect from the latest observation, when it was JSON-serializable. */
+  observedEffect?: unknown;
   evidenceState: EvidenceState;
   /** Why the evidence state was determined (from reconcile()). */
   evidenceReason: ReasonCode;
