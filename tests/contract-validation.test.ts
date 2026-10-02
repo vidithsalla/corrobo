@@ -164,3 +164,13 @@ describe.skipIf(!connectionString)("settlement window recorded with the attempt 
     }
   });
 });
+
+describe("contract validation keeps what 0.5.0 accepted", () => {
+  it("maxAttempts: Infinity (retry a confirmed not-applied without limit) is still allowed", async () => {
+    const executed: string[] = [];
+    const contract = { ...baseContract(executed), retryPolicy: { maxAttempts: Number.POSITIVE_INFINITY, retryOnNotApplied: true } };
+    const result = await runEffect(new InMemoryStore(), contract, { identity: "v3", intent: { n: 1 } });
+    expect(result.disposition).toBe("RETRY");
+    expect(executed).toEqual(["v3"]);
+  });
+});

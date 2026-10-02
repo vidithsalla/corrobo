@@ -126,6 +126,8 @@ interface OpModel {
   landedSinceObserve: boolean;
   lastExecuteAt: number;
   lastObserveAt: number;
+  /** With a custom fingerprint (which ignores memo): the memo of the request that created it. */
+  recordedMemo: string | null;
 }
 
 interface CallState {
@@ -149,6 +151,8 @@ interface World {
   call: CallState | null;
   concurrent: boolean;
   tokenOwner: Map<string, { opId: string; generation: number }>;
+  /** The contract's current maxInFlightMs (a deploy can change it mid-run). */
+  window: number;
   trace: string[];
   violations: string[];
   stats: Record<string, number>;
@@ -224,12 +228,29 @@ function validApproval(op: OpModel, now: number): Approval | null {
   return a;
 }
 
-function makeContract(world: World, ops: Map<string, OpModel>, options: { maxApprovalAgeMs?: number; withRevalidate: boolean }) {
+type ModelIntent = { ref: string; memo: string };
+
+function makeContract(
+  world: World,
+  ops: Map<string, OpModel>,
+  options: { maxApprovalAgeMs?: number; withRevalidate: boolean; customFingerprint: boolean }
+) {
   const violation = (msg: string) => world.violations.push(`event ${world.event}: ${msg}`);
-  return defineContract<{ ref: string }, { actor: string }>()({
+  // With a custom fingerprint, two intents differing only in memo are the same operation, and
+  // corrobo must keep acting on the memo it recorded, whatever later requests carry.
+  const checkMemo = (where: string, intent: ModelIntent) => {
+    const op = ops.get(intent.ref);
+    if (op && options.customFingerprint && op.recordedMemo !== null && intent.memo !== op.recordedMemo) {
+      violation(`${op.id}: ${where} got memo ${intent.memo}, recorded ${op.recordedMemo}`);
+    }
+  };
+  return defineContract<ModelIntent, { actor: string }>()({
     operationType: OPERATION_TYPE,
     retryPolicy: { maxAttempts: MAX_ATTEMPTS, retryOnNotApplied: true },
-    maxInFlightMs: MAX_IN_FLIGHT_MS,
+    get maxInFlightMs() {
+      return world.window;
+    },
+    ...(options.customFingerprint ? { fingerprintIntent: (intent: ModelIntent) => JSON.stringify({ ref: intent.ref }) } : {}),
     ...(options.maxApprovalAgeMs !== undefined ? { maxApprovalAgeMs: options.maxApprovalAgeMs } : {}),
     authorize: (intent) => ({ requiresReview: ops.get(intent.ref)!.needsReviewAtCreation }),
     ...(options.withRevalidate
@@ -245,6 +266,7 @@ function makeContract(world: World, ops: Map<string, OpModel>, options: { maxApp
               if (context?.actor !== call.actor) violation(`${op.id}: revalidate() got context ${JSON.stringify(context)}, call actor ${call.actor}`);
             }
             if (intent.ref !== op.id) violation(`${op.id}: revalidate() got intent ${JSON.stringify(intent)}`);
+            checkMemo("revalidate()", intent);
             if (attemptNumber !== op.reservations + 1) violation(`${op.id}: revalidate() for attempt ${attemptNumber} after ${op.reservations} attempts`);
             if (record.identity.id !== op.id) violation(`${op.id}: revalidate() got another record`);
             const expected = validApproval(op, world.time);
@@ -291,8 +313,9 @@ function makeContract(world: World, ops: Map<string, OpModel>, options: { maxApp
           }
         }
       : {}),
-    execute: async ({ identity, attemptNumber }) => {
+    execute: async ({ identity, attemptNumber, intent }) => {
       const op = ops.get(identity.id)!;
+      checkMemo("execute()", intent);
       world.executes += 1;
       op.inExecute += 1;
       if (op.inExecute > 1) violation(`${op.id}: two execute() calls at once`);
@@ -303,6 +326,10 @@ function makeContract(world: World, ops: Map<string, OpModel>, options: { maxApp
       if (op.lastEvidence === "PENDING") violation(`${op.id}: execute() while the last evidence was PENDING`);
       if (op.pendingRecovery) violation(`${op.id}: execute() after a crash, before observing what the crashed attempt did`);
       if (attemptNumber !== op.reservations) violation(`${op.id}: execute(attempt ${attemptNumber}) but ${op.reservations} reserved`);
+      // Never re-send while an earlier request could still land (within the window it was sent
+      // under), whether or not it ends up landing.
+      const inFlight = world.held.find((h) => h.id === op.id && world.time < h.landBy);
+      if (inFlight) violation(`${op.id}: execute() at ${world.time} while an earlier request could still land until ${inFlight.landBy}`);
       if (options.withRevalidate && call && !world.concurrent) {
         const n = call.log.length;
         if (call.log[n - 1] !== "reserve" || call.log[n - 2] !== "revalidate" || call.verdict !== "proceed") {
@@ -333,7 +360,8 @@ function makeContract(world: World, ops: Map<string, OpModel>, options: { maxApp
         case "drops":
           throw new Error("connection reset before the request was sent");
         case "holds":
-          world.held.push({ id: identity.id, landBy: world.time + MAX_IN_FLIGHT_MS });
+          // It can land any time within the window it was sent under, whatever a later deploy says.
+          world.held.push({ id: identity.id, landBy: world.time + world.window });
           throw new Error("timed out");
       }
     },
@@ -375,13 +403,14 @@ async function seedLegacy(store: EffectStore, op: OpModel, world: World, contrac
   const reason = { code: "POLICY_REVIEW_REQUIRED", summary: "needs review (legacy)" };
   op.created = true;
   op.everNeededReview = true;
+  op.recordedMemo = "seed";
   if (op.shape === "v03Rejected") {
-    await store.createOperation({ identity, intent: { ref: op.id }, status: "CLOSED", reviewReason: reason });
+    await store.createOperation({ identity, intent: { ref: op.id, memo: "seed" }, status: "CLOSED", reviewReason: reason });
     op.rejected = true;
     op.closed = true;
     return;
   }
-  const created = await store.createOperation({ identity, intent: { ref: op.id }, status: "OPEN", reviewReason: reason });
+  const created = await store.createOperation({ identity, intent: { ref: op.id, memo: "seed" }, status: "OPEN", reviewReason: reason });
   op.unattributedApproval = true;
   let version = created.version;
   if (op.shape === "v03ApprovedAfterRetry") {
@@ -414,7 +443,7 @@ async function seedLegacy(store: EffectStore, op: OpModel, world: World, contrac
           decision: "approved",
           reviewer: "legacy",
           decidedAt: now,
-          intentFingerprint: fingerprintIntent(contract, { ref: op.id }),
+          intentFingerprint: fingerprintIntent(contract, { ref: op.id, memo: "seed" }),
           recordedAt: now,
           attemptCount: 0
         } as unknown as RecordedReview
@@ -443,6 +472,7 @@ async function runSeed(
     call: null,
     concurrent: false,
     tokenOwner: new Map(),
+    window: MAX_IN_FLIGHT_MS,
     trace: [],
     violations: [],
     stats: {}
@@ -473,14 +503,16 @@ async function runSeed(
       pendingRecovery: false,
       landedSinceObserve: false,
       lastExecuteAt: -1,
-      lastObserveAt: -1
+      lastObserveAt: -1,
+      recordedMemo: null
     });
   }
-  const maxApprovalAgeMs = r.chance(0.5) ? r.int(4_000, 20_000) : undefined;
+  const maxApprovalAgeMs = r.chance(0.5) ? r.int(3_000, 12_000) : undefined;
   const withRevalidate = r.chance(0.8);
-  const contract = makeContract(world, ops, { maxApprovalAgeMs, withRevalidate });
+  const customFingerprint = r.chance(0.3);
+  const contract = makeContract(world, ops, { maxApprovalAgeMs, withRevalidate, customFingerprint });
   const store = instrument(await makeStore(), world, ops);
-  world.trace.push(`seed ${seed}: maxApprovalAgeMs=${maxApprovalAgeMs ?? "none"} revalidate=${withRevalidate}`);
+  world.trace.push(`seed ${seed}: maxApprovalAgeMs=${maxApprovalAgeMs ?? "none"} revalidate=${withRevalidate} customFingerprint=${customFingerprint}`);
   for (const op of ops.values()) {
     if (op.shape !== "fresh") {
       await seedLegacy(store, op, world, contract);
@@ -488,7 +520,11 @@ async function runSeed(
       world.trace.push(`  ${op.id} starts as ${op.shape}`);
     }
   }
-  const fingerprintOf = (ref: string) => fingerprintIntent(contract, { ref });
+  // With the default fingerprint every request repeats the recorded memo (anything else would be
+  // a different intent); with the custom one, requests vary it and corrobo must ignore that.
+  const memoOf = (op: OpModel) => op.recordedMemo ?? "m";
+  const requestMemo = (op: OpModel) => (customFingerprint ? r.pick(["a", "b", "c"]) : memoOf(op));
+  const fingerprintOf = (ref: string) => fingerprintIntent(contract, { ref, memo: memoOf(ops.get(ref) ?? ([...ops.values()][0])) });
 
   /** A new review the oracle accepts as begun: a new token, never seen anywhere before. */
   const reviewBegan = (op: OpModel, token: string) => {
@@ -573,7 +609,18 @@ async function runSeed(
   for (let step = 0; step < steps; step++) {
     world.event += 1;
     const op = ops.get(r.pick([...ops.keys()]))!;
-    const action = r.weighted({ run: 40, review: 28, advance: 12, land: 8, concurrent: 6, legacyReopen: 3, legacyApprove: 3 });
+    const action = r.weighted({ run: 40, review: 28, advance: 12, land: 8, concurrent: 6, legacyReopen: 3, legacyApprove: 3, deploy: 6 });
+
+    if (action === "deploy") {
+      // A deploy changes the contract's maxInFlightMs; requests already in flight keep theirs.
+      const before = world.window;
+      // With a request in flight, shrink the window: the case a recorded window must withstand.
+      world.window = world.held.length > 0 ? 1_000 : r.pick([1_000, 5_000, 15_000]);
+      if (world.window < before && world.held.length > 0) count(world, "deploy shortened the window while a request was in flight");
+      world.trace.push(`#${world.event} deploy: maxInFlightMs=${world.window}`);
+      count(world, "deploy changed maxInFlightMs");
+      continue;
+    }
 
     if (action === "advance") {
       const ms = r.pick([200, 1_000, 3_000, 6_000, 25_000]);
@@ -648,7 +695,7 @@ async function runSeed(
       world.trace.push(`#${world.event} concurrent run + ${other} on ${op.id}`);
       count(world, `concurrent run + ${other}`);
       const run = () =>
-        runEffect(store, contract, { identity: op.id, intent: { ref: op.id }, context: { actor: "worker" } }).catch((e) => {
+        runEffect(store, contract, { identity: op.id, intent: { ref: op.id, memo: customFingerprint ? "c" : memoOf(op) }, context: { actor: "worker" } }).catch((e) => {
           if (e instanceof SimulatedCrash) return null;
           throw e;
         });
@@ -667,6 +714,7 @@ async function runSeed(
       const record = await store.getOperation(op.id);
       if (record) {
         op.created = true;
+        if (op.recordedMemo === null) op.recordedMemo = (record.intent as ModelIntent).memo === "c" || !customFingerprint ? (record.intent as ModelIntent).memo : "c";
         op.reservations = Math.max(op.reservations, record.attempts.length);
         if (record.review?.reviewer === "bob" && record.review.reviewToken === tokenBefore && tokenBefore !== null) {
           op.approval = {
@@ -699,8 +747,11 @@ async function runSeed(
     if (action === "run") {
       world.transport = r.weighted({ applies: 45, respondsNotApplied: 20, drops: 15, holds: 20 });
       world.observeMode = r.weighted({ normal: 84, fails: 4, pending: 9, conflict: 3 });
-      world.verdict = r.weighted({ proceed: 45, requiresReview: 12, reject: 4, throws: 8, invalid: 4, slowProceed: 12, selfCheck: 15 });
-      world.crash = r.chance(0.1) ? r.pick(["afterReserve", "beforeResolve"] as const) : null;
+      world.verdict = r.weighted({ proceed: 41, requiresReview: 12, reject: 4, throws: 8, invalid: 4, slowProceed: 18, selfCheck: 13 });
+      world.crash = r.chance(0.15) ? r.pick(["afterReserve", "beforeResolve", "beforeResolve"] as const) : null;
+      // A crash while the request is still in flight is the case a later, shorter deploy window
+      // must not shortcut, so make it common.
+      if (world.crash === "beforeResolve" && r.chance(0.6)) world.transport = "holds";
       const actor = r.pick(["agent", "worker", "alice", "bob"]);
       const call: CallState = { actor, log: [], verdict: null, sawEffect: false, approvalExpiredDuringRevalidate: false };
       world.call = call;
@@ -710,7 +761,10 @@ async function runSeed(
         `#${world.event} run ${op.id} actor=${actor} transport=${world.transport} observe=${world.observeMode} revalidate=${world.verdict} crash=${world.crash ?? "no"}${readOnly ? " (lock held)" : ""}`
       );
       try {
-        const result = await runEffect(store, contract, { identity: op.id, intent: { ref: op.id }, context: { actor } });
+        const memo = requestMemo(op);
+        const createsIt = !op.created && !readOnly;
+        if (createsIt) op.recordedMemo = memo; // the request that creates it records its memo
+        const result = await runEffect(store, contract, { identity: op.id, intent: { ref: op.id, memo }, context: { actor } });
         if (!readOnly) op.created = true;
         world.trace.push(`    -> ${result.status} ${result.disposition ?? "-"} ${result.dispositionReason.code} [${call.log.join(",")}]`);
         count(world, `run: ${result.dispositionReason.code}`);
@@ -720,6 +774,10 @@ async function runSeed(
         }
         checkRun(op, result, call, { readOnly, createdNow });
         // Audit: the attempt this call made records the approval it ran under.
+        if (world.executes !== executesBefore) {
+          const latest = (await store.getOperation(op.id))?.attempts.at(-1);
+          if (latest?.maxInFlightMs !== world.window) violation(`${op.id}: attempt recorded maxInFlightMs ${latest?.maxInFlightMs}, sent under ${world.window}`);
+        }
         if (world.executes !== executesBefore && op.everNeededReview) {
           const record = await store.getOperation(op.id);
           const attempt = record?.attempts[record.attempts.length - 1];
@@ -729,7 +787,7 @@ async function runSeed(
         }
       } catch (err) {
         if (!(err instanceof SimulatedCrash)) throw err;
-        op.created = true;
+        op.created = true; // crash points all come after the record is created
         world.trace.push(`    -> crashed (${(err as Error).message}) [${call.log.join(",")}]`);
         count(world, "crash");
       } finally {
@@ -929,7 +987,9 @@ const REQUIRED_COVERAGE = [
   "run: AWAITING_CONVERGENCE",
   "run: EVIDENCE_INSUFFICIENT",
   "run: STATE_CONFLICT",
-  "run: RETRY_NOT_SAFE_OR_EXHAUSTED"
+  "run: RETRY_NOT_SAFE_OR_EXHAUSTED",
+  "deploy changed maxInFlightMs",
+  "deploy shortened the window while a request was in flight"
 ];
 
 describe("review flow: model-based (InMemoryStore)", () => {

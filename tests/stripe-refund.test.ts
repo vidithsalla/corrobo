@@ -299,4 +299,25 @@ describe("Stripe refund example", () => {
     expect(result).toMatchObject({ evidenceState: "APPLIED", disposition: "COMPLETE" });
     expect(client.createdRefundCount).toBe(151);
   });
+
+  it("a list that never ends (has_more forever) gives up after a bounded number of pages: UNKNOWN, no hang", async () => {
+    const client = new FakeStripeClient();
+    client.seedCharge("ch_17", 5000);
+    client.scheduleFault("ch_17", { createFailures: 1, mode: "beforeCommit" });
+    let listCalls = 0;
+    const endless = {
+      refunds: {
+        ...client.refunds,
+        list: async () => {
+          listCalls += 1;
+          return { data: [{ id: "re_other", status: "succeeded" as const, amount: 1, charge: "ch_17", metadata: { corrobo_operation: "someone-else" } }], has_more: true };
+        }
+      }
+    };
+    const contract = createRefundContract({ client: endless });
+    const result = await runEffect(new InMemoryStore(), contract, { identity: "refund-17", intent: { chargeId: "ch_17", amountCents: 5000 } });
+    expect(result).toMatchObject({ evidenceState: "UNKNOWN", disposition: "INVESTIGATE" });
+    expect(listCalls).toBe(50);
+    expect(client.createdRefundCount).toBe(0);
+  });
 });

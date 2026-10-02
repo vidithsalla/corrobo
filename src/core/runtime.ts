@@ -550,7 +550,10 @@ function validateContract(contract: EffectContract<any, any, any, any>): void {
   }
   const policy = contract.retryPolicy;
   if (typeof policy !== "object" || policy === null) fail("needs a retryPolicy");
-  if (!Number.isSafeInteger(policy.maxAttempts) || policy.maxAttempts < 1) fail("needs retryPolicy.maxAttempts to be an integer >= 1");
+  const maxAttempts = policy.maxAttempts;
+  if (!(maxAttempts === Number.POSITIVE_INFINITY || (Number.isSafeInteger(maxAttempts) && maxAttempts >= 1))) {
+    fail("needs retryPolicy.maxAttempts to be an integer >= 1 (or Infinity)");
+  }
   if (typeof policy.retryOnNotApplied !== "boolean") fail("needs retryPolicy.retryOnNotApplied to be true or false");
   for (const field of ["maxInFlightMs", "maxApprovalAgeMs"] as const) {
     const value = contract[field];
