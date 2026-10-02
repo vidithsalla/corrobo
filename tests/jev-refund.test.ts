@@ -5,6 +5,7 @@ import { createJevRefundContract, idempotencyKeyFor } from "../examples/jev-refu
 import { FakeRefundLedger } from "../examples/jev-refund/fake-refund-ledger";
 import { MockRefundJudgmentProvider } from "../examples/jev-refund/judgment-provider";
 import type { RefundJudgment, RefundJudgmentInput, RefundJudgmentProvider } from "../examples/jev-refund/judgment-provider";
+import { tokenOf } from "./support/review-token";
 
 /** Counts calls so tests can assert Jev is consulted exactly once (in authorize()) and never again. */
 class SpyJudgmentProvider implements RefundJudgmentProvider {
@@ -87,7 +88,7 @@ describe("Jev + corrobo refund example", () => {
     expect(awaiting.disposition).toBe("REVIEW");
     expect(ledger.createdRefundCount).toBe(0);
 
-    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer: "reviewer@example.com" } });
+    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewToken: await tokenOf(store, identity), reviewer: "reviewer@example.com" } });
 
     const approved = await runEffect(store, contract, { identity, intent });
     expect(approved.disposition).toBe("COMPLETE");

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { InMemoryStore } from "../src/stores/memory";
 import { reviewEffect, runEffect } from "../src/core/runtime";
 import type { EffectContract } from "../src/core/types";
+import { tokenOf } from "./support/review-token";
 
 function makeReviewedContract(executeCalls: { count: number }): EffectContract<Record<string, never>, unknown, unknown> {
   return {
@@ -34,7 +35,7 @@ describe("REVIEW rejection", () => {
     expect(awaiting.disposition).toBe("REVIEW");
     expect(awaiting.status).toBe("AWAITING_REVIEW");
 
-    const rejected = await reviewEffect(store, contract, { identity, decision: { decision: "rejected", reviewer: "reviewer@example.com" } });
+    const rejected = await reviewEffect(store, contract, { identity, decision: { decision: "rejected", reviewToken: await tokenOf(store, identity), reviewer: "reviewer@example.com" } });
 
     await runEffect(store, contract, { identity, intent: {} });
     expect(rejected.disposition).toBe("REVIEW");
@@ -50,11 +51,13 @@ describe("REVIEW rejection", () => {
     const identity = { id: "review-reject-2", operationType: contract.operationType };
 
     await runEffect(store, contract, { identity, intent: {} });
-    await reviewEffect(store, contract, { identity, decision: { decision: "rejected", reviewer: "reviewer@example.com" } });
+    await reviewEffect(store, contract, { identity, decision: { decision: "rejected", reviewToken: await tokenOf(store, identity), reviewer: "reviewer@example.com" } });
     await runEffect(store, contract, { identity, intent: {} });
 
     const again1 = await runEffect(store, contract, { identity, intent: {} });
-    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer: "reviewer@example.com" } });
+    await expect(
+      reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewToken: await tokenOf(store, identity), reviewer: "reviewer@example.com" } })
+    ).rejects.toMatchObject({ name: "ReviewNotAcceptedError", code: "NOT_AWAITING_REVIEW" });
     const again2 = await runEffect(store, contract, { identity, intent: {} });
     expect(again1.status).toBe("CLOSED");
     expect(again2.status).toBe("CLOSED");
@@ -70,7 +73,7 @@ describe("REVIEW rejection", () => {
     const identity = { id: "review-approve-1", operationType: contract.operationType };
 
     await runEffect(store, contract, { identity, intent: {} });
-    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer: "reviewer@example.com" } });
+    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewToken: await tokenOf(store, identity), reviewer: "reviewer@example.com" } });
     const approved = await runEffect(store, contract, { identity, intent: {} });
     expect(approved.disposition).toBe("COMPLETE");
     expect(executeCalls.count).toBe(1);

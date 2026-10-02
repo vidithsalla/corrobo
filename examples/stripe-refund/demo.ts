@@ -92,7 +92,10 @@ async function main(): Promise<void> {
   const intent7 = { chargeId: "ch_7", amountCents: 2_000_000 };
   const r7a = await runEffect(store, contract, { identity: identity7, intent: intent7 });
   log("above review threshold -> REVIEW, Stripe never called", { disposition: r7a.disposition, createdRefundsSoFar: client.createdRefundCount });
-  await reviewEffect(store, contract, { identity: identity7, decision: { decision: "approved", reviewer: "ops@example.com" } });
+  await reviewEffect(store, contract, {
+    identity: identity7,
+    decision: { decision: "approved", reviewer: "ops@example.com", reviewToken: r7a.reviewToken! }
+  });
   const r7b = await runEffect(store, contract, { identity: identity7, intent: intent7 });
   log("after approval -> APPLIED / COMPLETE", { evidenceState: r7b.evidenceState, disposition: r7b.disposition });
 }

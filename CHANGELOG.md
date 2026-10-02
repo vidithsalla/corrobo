@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **A decision made for an earlier review could approve a later one (0.4.0).** If `revalidate()` sent an approved operation back to review, a decision from the first review (say, from a reviewer's stale screen) was accepted for the second, and the operation executed. Each review now has its own token, which a decision must carry, and a decision dated before the current review began is refused. Reported with a reproduction by Ömer Faruk Koç.
+
+### Upgrading from 0.4.0
+
+1. **Drain 0.4.0 workers, then run `PostgresStore.migrate(pool)` once** before 0.5.0 serves traffic. It adds a nullable `review_episode` column in place. Don't run both versions against the same table: a 0.4.0 worker can send an operation back to review without opening a new review. (0.5.0 refuses the already-answered token in that case and opens a new review on the next `runEffect()`, but draining is the clean path.)
+2. **Approvals recorded by 0.4.0 need a new review.** They carry no token, so they can't be tied to a review, and one may have come in through the bug above. An operation 0.4.0 approved that hasn't finished goes back to `AWAITING_REVIEW` with `APPROVAL_NOT_RECORDED` before any further attempt.
+3. **`ReviewDecision.reviewToken` is required.** Keep `result.reviewToken` from the result that reported `AWAITING_REVIEW` with your review task, and pass it with the decision. An operation already awaiting review gets a token on its next `runEffect()`.
+4. **`reviewEffect()` throws `ReviewNotAcceptedError` instead of returning quietly** when it doesn't record a decision: not awaiting review, a stale token, a decision dated before the review began, a different intent, or an approval that has already expired. `.code` says which, and `.current` is the operation's state. The intent-mismatch and already-expired refusals used to be plain `Error`s.
+5. **New required fields:** `EffectResult.reviewToken` (`string | null`) and `RecordedReview.reviewToken`. Custom stores must persist `OperationRecord.reviewEpisode`, including when an operation is created with one (`NewOperationInput.reviewEpisode`).
+
+### Added
+
+- `ReviewEpisode` (`OperationRecord.reviewEpisode`), `EffectResult.reviewToken`, `ReviewNotAcceptedError` / `ReviewRefusal`.
+- Docs: the `runEffect()`/`reviewEffect()` split is an API boundary that enables capability separation, not a privilege boundary that provides it; `context` must be built on your server; keep `revalidate()` fast and bounded.
+
 ## 0.4.0 — 2026-10-01
 
 Pre-execute checks for agent runtimes: `revalidate()` before every attempt, and review decisions that record who approved what, bound to the intent and checked before each attempt. Both were designed in review by Ömer Faruk Koç.

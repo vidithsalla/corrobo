@@ -98,8 +98,11 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 7.23 | An operation approved by 0.3.x, which recorded no decision (or any approval on record without a reviewer), after upgrading | `AWAITING_REVIEW` with `APPROVAL_NOT_RECORDED` before any further attempt | Not until re-approved | T149, T150, T159 |
 | 7.24 | `reviewEffect()` records a decision | Records it and nothing else: no `execute()`, no `observe()`; the result says approved, not attempted since (also after earlier attempts); the next `runEffect()` attempts | Not by `reviewEffect()` | T151, T155 |
 | 7.25 | `runEffect()` is handed a decision object (e.g. by an agent's tool) | `TypeError`, nothing recorded: decisions only go through `reviewEffect()` | No | T152 |
-| 7.26 | `reviewEffect()` while another call holds the operation (or writes to it mid-review), or on one that isn't awaiting review | Busy: `OperationBusyError`, nothing recorded. Not awaiting review: current state returned, nothing recorded | No | T153, T154, T156, T157 |
+| 7.26 | `reviewEffect()` while another call holds the operation (or writes to it mid-review), or on one that isn't awaiting review | Busy: `OperationBusyError`, nothing recorded. Not awaiting review: `ReviewNotAcceptedError` (`NOT_AWAITING_REVIEW`) with the current state, nothing recorded | No | T153, T154, T156, T157 |
 | 7.27 | Approved (separately) after an attempt that got a not-applied response | The next `runEffect()` re-observes that attempt first (also if the review record lacks its attempt count); an effect that appeared during the wait is `COMPLETE` | No | T155, T158 |
+| 7.28 | A decision made on an earlier review's screen arrives after the operation went to review again | Refused (`ReviewNotAcceptedError`, `STALE_REVIEW_TOKEN`); a decision dated before the current review began is refused too (`DECIDED_BEFORE_REVIEW_OPENED`) | No | T160, T161 |
+| 7.29 | Each review of an operation | New token and generation each time (including after an expired approval); a token from another operation is refused; operations that awaited review before tokens existed get one on their next `runEffect()`; survives a restart | — | T162, T163, T164, T165, T166 |
+| 7.31 | Upgrading from 0.4.0: an approval it recorded (no token), or an operation a 0.4.0 worker sent back to review without a new review | The approval isn't honored (`APPROVAL_NOT_RECORDED`, new review); the already-answered token is refused and the next `runEffect()` opens a new review | No | T171, T172, T173 |
 
 ## 8. Concurrency and lock loss
 
@@ -329,9 +332,19 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T151** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "records the decision and does nothing else: no execute, no observe; runEffect() then makes the attempt"
 - **T152** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "runEffect() refuses a decision object: decisions go through reviewEffect()"
 - **T153** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "while another call holds the operation it throws OperationBusyError and records nothing"
-- **T154** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an operation that isn't awaiting review is returned unchanged, and the decision isn't recorded"
+- **T154** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a decision on an operation that isn't awaiting review is refused loudly (ReviewNotAcceptedError), and nothing is recorded"
 - **T155** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "approved after an attempt that got a not-applied response: the next runEffect() re-observes first, so an effect that appeared meanwhile isn't repeated"
 - **T156** [`tests/postgres-review.test.ts`](../tests/postgres-review.test.ts) — "reviewEffect() throws OperationBusyError while another process holds the operation's advisory lock"
 - **T157** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a concurrent write while the decision is being recorded is OperationBusyError, and the decision isn't recorded"
 - **T158** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review record without attemptCount is treated as recent: the next runEffect() re-observes first"
+- **T160** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a decision made on an earlier review's screen can't approve a later review of the same operation (stale token)"
+- **T161** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a decision dated before the current review began is refused even with the current token"
+- **T162** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "each review gets a new token (and generation), only while AWAITING_REVIEW, distinct across operations"
+- **T163** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an expired approval opens a new review: the old token no longer answers it"
+- **T164** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an operation that went to review before tokens existed gets one on its next runEffect()"
+- **T165** [`tests/postgres-review.test.ts`](../tests/postgres-review.test.ts) — "review tokens persist: minted at creation, read back by another process, and a stale one is refused there"
+- **T166** [`tests/postgres-review.test.ts`](../tests/postgres-review.test.ts) — "migrate() adds review_episode to an older table; a row awaiting review there gets a token on its next run"
+- **T171** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval recorded without a token (corrobo 0.4.0) isn't honored after upgrading: a new review opens"
+- **T172** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review already answered can't be answered again, even if the operation is put back to review without a new one"
+- **T173** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review a 0.4.0 worker answered (no token) and then reopened can't be answered with its old token"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"

@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { decideDisposition } from "./disposition";
 import type { DecideDispositionResult } from "./disposition";
 import { canonicalStringify, fingerprintIntent, materializeIntent } from "./fingerprint";
@@ -18,6 +19,7 @@ import type {
   ReasonCode,
   RecordedReview,
   ReviewDecision,
+  ReviewEpisode,
   ReviewRequest,
   ReservedAttempt,
   ResolvedAttempt,
@@ -79,7 +81,8 @@ function resultForInProgress<Observation>(identity: OperationRecord["identity"])
     observation: null,
     attempts: [],
     retryNotBefore: null,
-    review: null
+    review: null,
+    reviewToken: null
   };
 }
 
@@ -126,6 +129,83 @@ export class OperationBusyError extends Error {
     this.name = "OperationBusyError";
     this.identityId = identityId;
   }
+}
+
+/** Why reviewEffect() refused a well-formed decision (see ReviewNotAcceptedError). */
+export type ReviewRefusal =
+  | "NOT_AWAITING_REVIEW"
+  | "STALE_REVIEW_TOKEN"
+  | "DECIDED_BEFORE_REVIEW_OPENED"
+  | "INTENT_MISMATCH"
+  | "APPROVAL_ALREADY_EXPIRED";
+
+/**
+ * Thrown by reviewEffect() when it refuses a decision: the operation isn't awaiting review, the
+ * decision answers a different review (stale token, or dated before this review began), it was
+ * made for a different intent, or the approval has already expired. Nothing was recorded.
+ * `current` is the operation's state now, for showing the reviewer what actually happened.
+ */
+export class ReviewNotAcceptedError extends Error {
+  readonly identityId: string;
+  readonly code: ReviewRefusal;
+  readonly current: EffectResult<unknown>;
+  constructor(identityId: string, code: ReviewRefusal, message: string, current: EffectResult<unknown>) {
+    super(`corrobo: the review decision for operation "${identityId}" was not recorded (${code}): ${message}`);
+    this.name = "ReviewNotAcceptedError";
+    this.identityId = identityId;
+    this.code = code;
+    this.current = current;
+  }
+}
+
+/**
+ * The review a decision can answer right now: the operation awaits review and its episode hasn't
+ * been answered yet. An episode a recorded decision already answered is used up (e.g. a 0.4.0
+ * worker sent the operation back to review without opening a new one); its token never counts
+ * again, and runEffect() opens a new review instead.
+ */
+function openReview(record: OperationRecord): ReviewEpisode | null {
+  const episode = record.reviewEpisode;
+  if (record.status !== "AWAITING_REVIEW" || !episode) return null;
+  const review = record.review;
+  // Answered: a decision carries this episode's token; or, for a decision without a token (only
+  // corrobo 0.4.0 records those), it was recorded once this episode was open (both read the
+  // store's clock; a tie counts as answered, which only costs a new review, never a reused one).
+  const answered =
+    review !== undefined &&
+    (typeof review.reviewToken === "string"
+      ? review.reviewToken === episode.token
+      : Date.parse(review.recordedAt) >= Date.parse(episode.openedAt));
+  return answered ? null : episode;
+}
+
+/** The token a decision must carry right now (see openReview), or null. */
+function currentReviewToken(record: OperationRecord): string | null {
+  return openReview(record)?.token ?? null;
+}
+
+/**
+ * Begins a new review of this operation. The token is a digest of the operation, this review's
+ * generation and start time, the recorded intent's fingerprint and a random nonce, so no two
+ * reviews ever share one (even if a store lost the previous episode). It isn't a secret (it
+ * doesn't authenticate anyone); it's a binding, so a decision made for one review can't answer
+ * another.
+ */
+async function openReviewEpisode(
+  store: CoordinatedStore,
+  identity: OperationIdentity,
+  intentFingerprint: string,
+  previous: ReviewEpisode | undefined
+): Promise<ReviewEpisode> {
+  const generation = (previous?.generation ?? 0) + 1;
+  const openedAt = await safetyNow(store);
+  const token = createHash("sha256")
+    .update(
+      JSON.stringify([identity.operationType, identity.id, generation, openedAt, intentFingerprint, randomBytes(16).toString("hex")])
+    )
+    .digest("hex")
+    .slice(0, 32);
+  return { token, generation, openedAt };
 }
 
 const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/i;
@@ -176,8 +256,11 @@ function parseReviewDecision(input: unknown): ValidDecision {
   };
   if (typeof input !== "object" || input === null) fail(`must be a ReviewDecision object`);
   // Each field is read exactly once, so what is validated is what is recorded.
-  const { decision, reviewer, decidedAt, expiresAt, intentFingerprint, note } = input as ReviewDecision;
+  const { decision, reviewToken, reviewer, decidedAt, expiresAt, intentFingerprint, note } = input as ReviewDecision;
   if (decision !== "approved" && decision !== "rejected") fail(`.decision must be "approved" or "rejected"`);
+  if (typeof reviewToken !== "string" || reviewToken === "") {
+    fail(`.reviewToken must be the reviewToken from the result that reported AWAITING_REVIEW`);
+  }
   if (typeof reviewer !== "string" || reviewer.trim() === "") fail(`.reviewer must be a non-empty string`);
   const timeFormat = `an RFC 3339 timestamp with Z or an offset, e.g. "2026-10-01T12:00:00Z"`;
   const decided = decidedAt === undefined ? undefined : (canonicalTime(decidedAt) ?? fail(`.decidedAt must be ${timeFormat}`));
@@ -191,7 +274,7 @@ function parseReviewDecision(input: unknown): ValidDecision {
   }
   if (intentFingerprint !== undefined && typeof intentFingerprint !== "string") fail(`.intentFingerprint must be a string`);
   if (note !== undefined && typeof note !== "string") fail(`.note must be a string`);
-  const review: ValidDecision = { decision, reviewer };
+  const review: ValidDecision = { decision, reviewToken, reviewer };
   if (decided !== undefined) review.decidedAt = decided;
   if (expires !== undefined) review.expiresAt = expires;
   if (intentFingerprint !== undefined) review.intentFingerprint = intentFingerprint;
@@ -305,7 +388,8 @@ function resultBeforeAttempt<Observation>(
     observation: observation as ObservationResult<Observation> | null,
     attempts: record.attempts,
     retryNotBefore: null,
-    review: record.review ?? null
+    review: record.review ?? null,
+    reviewToken: currentReviewToken(record)
   };
 }
 
@@ -384,7 +468,8 @@ function resultFromRecord<Observation>(record: OperationRecord): EffectResult<Ob
       observation: null,
       attempts: record.attempts,
       retryNotBefore: null,
-      review: record.review ?? null
+      review: record.review ?? null,
+      reviewToken: currentReviewToken(record)
     };
   }
 
@@ -399,7 +484,8 @@ function resultFromRecord<Observation>(record: OperationRecord): EffectResult<Ob
     observation: latestObservation as ObservationResult<Observation> | null,
     attempts: record.attempts,
     retryNotBefore: latest.retryNotBefore ?? null,
-    review: record.review ?? null
+    review: record.review ?? null,
+    reviewToken: currentReviewToken(record)
   };
 }
 
@@ -652,15 +738,19 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
     version: record.version,
     attemptNumber: record.attempts.length + 1
   };
-  // An approval counts only with a recorded reviewer.
+  // An approval counts only with a recorded reviewer, given for the operation's current review
+  // (its token is that review's). One without (recorded by corrobo 0.4.0, which kept no tokens,
+  // or by a store that dropped them) fails closed below.
   const attributed =
     record.review?.decision === "approved" &&
     typeof record.review.reviewer === "string" &&
-    record.review.reviewer.trim() !== "";
+    record.review.reviewer.trim() !== "" &&
+    typeof record.review.reviewToken === "string" &&
+    record.review.reviewToken === record.reviewEpisode?.token;
   const approval = attributed ? { ...record.review! } : null;
   // Left review (it has a review reason) without an attributed approval on record: approved by
-  // corrobo 0.3.x, which kept no record of who approved what, or a record missing its reviewer.
-  // Fail closed: it needs a fresh review.
+  // corrobo 0.3.x or 0.4.0, or a record missing its reviewer or token. Fail closed: it needs a
+  // fresh review.
   const unrecordedApproval = !approval && record.reviewReason !== undefined;
   if (!contract.revalidate && !approval && !unrecordedApproval) {
     return performAttempt(store, contract, base, request.intent);
@@ -695,12 +785,16 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
   const blockedBy: BlockingCheck = { outcome: result.outcome, ...checked, recordVersion: base.version + 1 };
   const status: OperationStatus | undefined =
     result.outcome === "requiresReview" ? "AWAITING_REVIEW" : result.outcome === "reject" ? "CLOSED" : undefined;
+  const reviewEpisode =
+    result.outcome === "requiresReview"
+      ? await openReviewEpisode(store, base.identity, fingerprintIntent(contract, record.intent), record.reviewEpisode)
+      : undefined;
   const updated = await store.updateOperation(
     base.identity.id,
     {
       blockedBy,
       ...(status ? { status } : {}),
-      ...(result.outcome === "requiresReview" ? { reviewReason: result.reason } : {})
+      ...(reviewEpisode ? { reviewReason: result.reason, reviewEpisode } : {})
     },
     base.version
   );
@@ -844,13 +938,14 @@ export async function runEffect<Intent, Observation, Evidence, Context = unknown
  * call), then let runEffect() act on the operation, which checks the approval again before
  * every attempt. Keeping the two apart means the code that makes attempts can't approve them.
  *
- * - The decision is validated first (a malformed one throws TypeError) and bound to the recorded
- *   intent: if `decision.intentFingerprint` names a different intent, or an approval has already
- *   expired, it throws and nothing changes.
+ * - The decision is validated first (a malformed one throws TypeError), then must answer the
+ *   current review: its `reviewToken` must be the one the AWAITING_REVIEW result reported, and a
+ *   `decidedAt` can't predate this review. If it doesn't, if the operation isn't awaiting review
+ *   at all, if `decision.intentFingerprint` names a different intent, or if an approval has
+ *   already expired, it throws ReviewNotAcceptedError (with `.code` and `.current`) and nothing
+ *   is recorded.
  * - Approved: the operation becomes OPEN; the result says it hasn't been attempted since.
  *   Rejected: CLOSED, terminally.
- * - If the operation isn't awaiting review (already decided, never needed review, closed), the
- *   decision is not recorded and the current state is returned; compare `result.review`.
  * - If another call holds the operation's lock right now, throws OperationBusyError (nothing
  *   recorded). Like runEffect(), it first needs a connection from the store (for PostgresStore,
  *   from your pool), and waits for one if the pool is exhausted; it then re-reads and re-checks
@@ -879,10 +974,24 @@ export async function reviewEffect<Intent, Observation, Evidence, Context = unkn
           `review was made with the "${contract.operationType}" contract; nothing was recorded.`
       );
     }
+    const refuse = (code: ReviewRefusal, message: string): never => {
+      throw new ReviewNotAcceptedError(identity.id, code, message, resultFromRecord(existing));
+    };
+    const episode = openReview(existing);
     if (existing.status !== "AWAITING_REVIEW") {
-      return resultFromRecord(existing);
+      refuse("NOT_AWAITING_REVIEW", `it is ${existing.status}, not awaiting review; see error.current.`);
     }
-    const review = await recordReview(lock.store, contract, existing, decision);
+    if (!episode || decision.reviewToken !== episode.token) {
+      refuse(
+        "STALE_REVIEW_TOKEN",
+        "the decision's reviewToken isn't the current review's. It answers an earlier review, or another " +
+          "operation; show the reviewer the current review (result.reviewToken) instead."
+      );
+    }
+    if (decision.decidedAt !== undefined && Date.parse(decision.decidedAt) < Date.parse(episode!.openedAt)) {
+      refuse("DECIDED_BEFORE_REVIEW_OPENED", `it was decided at ${decision.decidedAt}, before this review began (${episode!.openedAt}).`);
+    }
+    const review = await recordReview(lock.store, contract, existing, decision, refuse);
     const updated = await lock.store.updateOperation(
       identity.id,
       { status: review.decision === "approved" ? "OPEN" : "CLOSED", review },
@@ -892,6 +1001,9 @@ export async function reviewEffect<Intent, Observation, Evidence, Context = unkn
     // what happens next): nothing has been attempted since, the next runEffect() will.
     return review.decision === "approved" ? resultBeforeAttempt(updated, null, approvedNotAttempted(review)) : resultFromRecord(updated);
   } catch (err) {
+    if (err instanceof ReviewNotAcceptedError) {
+      throw err;
+    }
     if (err instanceof StoreConflictError) {
       throw new OperationBusyError(identity.id);
     }
@@ -922,7 +1034,17 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
       identity: request.identity,
       intent: prepared.stored,
       status: initialStatus,
-      reviewReason: auth.requiresReview ? (auth.reason ?? defaultReviewReason()) : undefined
+      reviewReason: auth.requiresReview ? (auth.reason ?? defaultReviewReason()) : undefined,
+      ...(auth.requiresReview
+        ? {
+            reviewEpisode: await openReviewEpisode(
+              store,
+              request.identity,
+              prepared.fingerprint ?? fingerprintIntent(contract, prepared.stored as Intent),
+              undefined
+            )
+          }
+        : {})
     });
 
     if (auth.requiresReview) {
@@ -936,7 +1058,19 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
   }
 
   if (existing.status === "AWAITING_REVIEW") {
-    // Decisions are recorded by reviewEffect(); until one is, nothing happens here.
+    // Decisions are recorded by reviewEffect(); until one is, nothing happens here. An operation
+    // awaiting review without an open episode gets a new one now, so a decision has a current
+    // token to carry: it went to review before corrobo kept episodes (0.4.0 and earlier), or its
+    // episode was already answered (a 0.4.0 worker sent it back to review without opening one).
+    if (!openReview(existing)) {
+      const reviewEpisode = await openReviewEpisode(
+        store,
+        existing.identity,
+        fingerprintIntent(contract, existing.intent),
+        existing.reviewEpisode
+      );
+      return resultFromRecord(await store.updateOperation(existing.identity.id, { reviewEpisode }, existing.version));
+    }
     return resultFromRecord(existing);
   }
 
@@ -951,22 +1085,20 @@ async function recordReview(
   store: CoordinatedStore,
   contract: EffectContract<any, unknown, unknown, any>,
   record: OperationRecord,
-  decision: ValidDecision
+  decision: ValidDecision,
+  refuse: (code: ReviewRefusal, message: string) => never
 ): Promise<RecordedReview> {
   const intentFingerprint = fingerprintIntent(contract, record.intent);
   if (decision.intentFingerprint !== undefined && decision.intentFingerprint !== intentFingerprint) {
-    throw new Error(
-      `corrobo: this review decision for operation "${record.identity.id}" was made for a different intent than ` +
-        `the one recorded (intentFingerprint doesn't match); nothing was recorded or executed. Show the reviewer the ` +
-        `recorded intent and use fingerprintIntent(contract, intent) on that.`
+    refuse(
+      "INTENT_MISMATCH",
+      "it was made for a different intent than the one recorded (intentFingerprint doesn't match). Show the " +
+        "reviewer the recorded intent and use fingerprintIntent(contract, intent) on that."
     );
   }
   const now = await safetyNow(store);
   if (decision.expiresAt !== undefined && Date.parse(decision.expiresAt) <= Date.parse(now)) {
-    throw new Error(
-      `corrobo: this approval for operation "${record.identity.id}" expired at ${decision.expiresAt}, before it was ` +
-        `recorded; nothing was recorded or executed.`
-    );
+    refuse("APPROVAL_ALREADY_EXPIRED", `the approval expired at ${decision.expiresAt}, before it was recorded.`);
   }
   const review: RecordedReview = {
     decision: decision.decision,
@@ -974,6 +1106,7 @@ async function recordReview(
     decidedAt: decision.decidedAt ?? now,
     intentFingerprint,
     recordedAt: now,
+    reviewToken: decision.reviewToken,
     attemptCount: record.attempts.length
   };
   if (decision.expiresAt !== undefined) review.expiresAt = decision.expiresAt;

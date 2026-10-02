@@ -9,6 +9,7 @@ import type {
   OperationStatus,
   RecordedReview,
   ReservedAttemptInput,
+  ReviewEpisode,
   TransportOutcome
 } from "../core/types";
 
@@ -17,7 +18,7 @@ const TABLE = "corrobo_operations";
 /**
  * DDL for the single table this store needs. Safe to run repeatedly. The trailing ALTERs
  * upgrade a table created by an earlier corrobo in place: `version` (added in 0.3.0; existing
- * rows start at 0), and `blocked_by` and `review` (0.4.0; nullable).
+ * rows start at 0), `blocked_by` and `review` (0.4.0; nullable) and `review_episode` (0.5.0; nullable).
  */
 export const POSTGRES_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS ${TABLE} (
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS ${TABLE} (
 ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS blocked_by JSONB;
 ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS review JSONB;
+ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS review_episode JSONB;
 `;
 
 interface Row {
@@ -45,6 +47,7 @@ interface Row {
   attempts: AttemptRecord[];
   blocked_by: BlockingCheck | null;
   review: RecordedReview | null;
+  review_episode: ReviewEpisode | null;
   created_at: Date;
   updated_at: Date;
   /** BIGINT: node-postgres returns it as a string. */
@@ -86,6 +89,7 @@ function rowToRecord(row: Row): OperationRecord {
     attempts: row.attempts,
     ...(row.blocked_by ? { blockedBy: row.blocked_by } : {}),
     ...(row.review ? { review: row.review } : {}),
+    ...(row.review_episode ? { reviewEpisode: row.review_episode } : {}),
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     version: Number(row.version)
@@ -195,15 +199,16 @@ async function getOperationImpl(q: Queryable, identityId: string): Promise<Opera
 async function createOperationImpl(q: Queryable, input: NewOperationInput): Promise<OperationRecord> {
   try {
     const result = await q.query<Row>(
-      `INSERT INTO ${TABLE} (id, operation_type, intent, status, review_reason, attempts)
-       VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, '[]'::jsonb)
+      `INSERT INTO ${TABLE} (id, operation_type, intent, status, review_reason, review_episode, attempts)
+       VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6::jsonb, '[]'::jsonb)
        RETURNING *`,
       [
         input.identity.id,
         input.identity.operationType,
         JSON.stringify(input.intent),
         input.status,
-        input.reviewReason ? JSON.stringify(input.reviewReason) : null
+        input.reviewReason ? JSON.stringify(input.reviewReason) : null,
+        input.reviewEpisode ? JSON.stringify(input.reviewEpisode) : null
       ]
     );
     return rowToRecord(result.rows[0]);
@@ -301,7 +306,12 @@ async function setStatusImpl(
 }
 
 /** JSONB columns of the operation itself; each is written only when present in the update. */
-const UPDATABLE_JSON_COLUMNS = { reviewReason: "review_reason", blockedBy: "blocked_by", review: "review" } as const;
+const UPDATABLE_JSON_COLUMNS = {
+  reviewReason: "review_reason",
+  blockedBy: "blocked_by",
+  review: "review",
+  reviewEpisode: "review_episode"
+} as const;
 
 async function updateOperationImpl(
   q: Queryable,
