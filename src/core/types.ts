@@ -295,6 +295,11 @@ export interface EffectContract<Intent, Observation, Evidence, Context = unknown
    * stable, key-sorted JSON serialization (src/core/fingerprint.ts) when omitted — provide
    * this only if that default would treat two meaningfully-different intents as equal, or
    * two meaningfully-equal intents as different, for this operation type.
+   *
+   * With a custom fingerprint, once the operation is recorded every later call acts on the
+   * recorded intent (as the store returns it: from PostgresStore, its JSON form), never on the
+   * later request's: two intents your fingerprint calls equal are the same operation, and the
+   * one that was recorded (and reviewed) is the one executed.
    */
   fingerprintIntent?(intent: Intent): string;
   /**

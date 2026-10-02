@@ -139,6 +139,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 9.11 | Request's explicit `identity.operationType` differs from the contract's (or pass the id as a plain string) | Throws before anything is written or executed; a string id always uses the contract's `operationType` | No | T114, T115 |
 | 9.9 | Contract supplies its own `fingerprintIntent()` | corrobo uses it and does not apply the default JSON rules to that intent; the store must still be able to persist the intent | No | T70, T111 |
 | 9.7 | A new identity | A genuinely new operation | Yes (it's new) | T75 |
+| 9.12 | Custom `fingerprintIntent()` that ignores a field `execute()` reads; a later request differs in it | Same operation; corrobo acts on the recorded (reviewed) intent, never the later request's | Only as recorded | T180 |
 
 ## 10. Persistence and privacy
 
@@ -360,5 +361,6 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T177** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "a deploy that shortens maxInFlightMs doesn't let an attempt sent under the longer window be retried early"
 - **T178** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "%s is refused before anything runs"
 - **T179** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "is persisted on the attempt and read back by another process"
+- **T180** [`tests/recorded-intent.test.ts`](../tests/recorded-intent.test.ts) — "with a custom fingerprint, a later request can't change what the reviewer approved"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"
