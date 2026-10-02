@@ -300,6 +300,15 @@ export interface EffectContract<Intent, Observation, Evidence, Context = unknown
    *   key that stays the same across attempts) or the request provably never left the process.
    */
   maxInFlightMs?: number;
+  /**
+   * The longest an approval for this operation type is good for, in milliseconds, counted from
+   * when it was decided (or recorded, if that was earlier). It applies whether or not the
+   * decision has its own `expiresAt` (the earlier of the two wins), so a review screen that
+   * forgets to set one can't produce an approval that never expires. An approval that ages out
+   * before an attempt sends the operation back to review (APPROVAL_EXPIRED). Omit it to let
+   * approvals without `expiresAt` cover every later attempt.
+   */
+  maxApprovalAgeMs?: number;
 }
 
 /** An attempt whose outcome is not yet known — persisted BEFORE execute() is ever called. */

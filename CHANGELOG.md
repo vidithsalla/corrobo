@@ -17,6 +17,7 @@
 ### Added
 
 - `ReviewEpisode` (`OperationRecord.reviewEpisode`), `EffectResult.reviewToken`, `ReviewNotAcceptedError` / `ReviewRefusal`.
+- **`maxApprovalAgeMs` on contracts:** the longest any approval covers new attempts, counted from when it was decided, whether or not it set `expiresAt`. A review screen that forgets an expiry can no longer produce an approval that lasts forever.
 - Docs: the `runEffect()`/`reviewEffect()` split is an API boundary that enables capability separation, not a privilege boundary that provides it; `context` must be built on your server; keep `revalidate()` fast and bounded.
 
 ## 0.4.0 — 2026-10-01

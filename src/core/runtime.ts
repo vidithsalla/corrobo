@@ -622,14 +622,42 @@ function checkApproval(
       summary: "The recorded approval was given for a different intent than the one recorded for this operation. It needs a new review."
     };
   }
-  if (approval.expiresAt !== undefined && Date.parse(now) >= Date.parse(approval.expiresAt)) {
+  const expiry = approvalExpiry(contract, approval);
+  if (expiry && Date.parse(now) >= Date.parse(expiry.at)) {
     return {
       code: "APPROVAL_EXPIRED",
-      summary: `The approval expired at ${approval.expiresAt}, before this attempt. Nothing was executed; it needs a new review.`,
-      metadata: { expiresAt: approval.expiresAt }
+      summary:
+        `The approval expired at ${expiry.at} (${expiry.because}), before this attempt. ` +
+        "Nothing was executed; it needs a new review.",
+      metadata: { expiresAt: expiry.at, because: expiry.because }
     };
   }
   return null;
+}
+
+/**
+ * When an approval stops covering new attempts: its own expiresAt, or the contract's
+ * maxApprovalAgeMs after it was decided (or recorded, if earlier), whichever comes first.
+ */
+function approvalExpiry(
+  contract: EffectContract<any, unknown, unknown, any>,
+  approval: Pick<RecordedReview, "expiresAt" | "decidedAt" | "recordedAt">
+): { at: string; because: string } | null {
+  const maxAge = contract.maxApprovalAgeMs;
+  if (maxAge !== undefined && !(typeof maxAge === "number" && Number.isFinite(maxAge) && maxAge >= 0)) {
+    throw new TypeError(`corrobo: contract "${contract.operationType}" has an invalid maxApprovalAgeMs; it must be a finite number >= 0.`);
+  }
+  const candidates: { at: number; because: string }[] = [];
+  if (approval.expiresAt !== undefined) {
+    candidates.push({ at: Date.parse(approval.expiresAt), because: "its expiresAt" });
+  }
+  if (maxAge !== undefined) {
+    const decided = Math.min(Date.parse(approval.decidedAt), Date.parse(approval.recordedAt));
+    candidates.push({ at: decided + maxAge, because: `the contract's maxApprovalAgeMs of ${maxAge}` });
+  }
+  if (candidates.length === 0) return null;
+  const first = candidates.reduce((a, b) => (b.at < a.at ? b : a));
+  return { at: new Date(first.at).toISOString(), because: first.because };
 }
 
 const APPROVAL_NOT_RECORDED: ReasonCode = {
@@ -1097,8 +1125,15 @@ async function recordReview(
     );
   }
   const now = await safetyNow(store);
-  if (decision.expiresAt !== undefined && Date.parse(decision.expiresAt) <= Date.parse(now)) {
-    refuse("APPROVAL_ALREADY_EXPIRED", `the approval expired at ${decision.expiresAt}, before it was recorded.`);
+  if (decision.decision === "approved") {
+    const expiry = approvalExpiry(contract, {
+      expiresAt: decision.expiresAt,
+      decidedAt: decision.decidedAt ?? now,
+      recordedAt: now
+    });
+    if (expiry && Date.parse(expiry.at) <= Date.parse(now)) {
+      refuse("APPROVAL_ALREADY_EXPIRED", `the approval expired at ${expiry.at} (${expiry.because}), before it was recorded.`);
+    }
   }
   const review: RecordedReview = {
     decision: decision.decision,

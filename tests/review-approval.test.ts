@@ -908,3 +908,85 @@ describe("review tokens: a decision answers one review", () => {
     expect(ledger.credits).toEqual([]);
   });
 });
+
+describe("maxApprovalAgeMs: approvals age out", () => {
+  function agedContract(ledger: ReturnType<typeof makeLedger>, maxApprovalAgeMs: number) {
+    return { ...makeContract(ledger), maxApprovalAgeMs };
+  }
+
+  it("an approval without expiresAt stops covering attempts once it is older than maxApprovalAgeMs", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = agedContract(ledger, 60_000);
+    const waiting = await runEffect(store, contract, { identity: "g1", intent });
+    ledger.respondNotAppliedOnce();
+    await reviewEffect(store, contract, {
+      identity: "g1",
+      decision: { decision: "approved", reviewer: "A", reviewToken: waiting.reviewToken! }
+    });
+    expect((await runEffect(store, contract, { identity: "g1", intent })).disposition).toBe("RETRY");
+
+    store.time += 60_000;
+    const aged = await runEffect(store, contract, { identity: "g1", intent });
+    expect(aged).toMatchObject({ status: "AWAITING_REVIEW", dispositionReason: { code: "APPROVAL_EXPIRED" } });
+    expect(aged.dispositionReason.metadata).toMatchObject({ because: "the contract's maxApprovalAgeMs of 60000" });
+    expect(ledger.credits).toEqual([]);
+  });
+
+  it("the earlier of expiresAt and maxApprovalAgeMs wins, and age counts from decidedAt when that is earlier", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = agedContract(ledger, 60_000);
+    const waiting = await runEffect(store, contract, { identity: "g2", intent });
+    store.time += 30_000;
+    // Decided 20s after the review opened, recorded 10s later, with a generous expiresAt.
+    await reviewEffect(store, contract, {
+      identity: "g2",
+      decision: {
+        decision: "approved",
+        reviewer: "A",
+        reviewToken: waiting.reviewToken!,
+        decidedAt: store.iso(-10_000),
+        expiresAt: store.iso(3_600_000)
+      }
+    });
+    store.time += 50_000; // 60s after decidedAt, 50s after recording
+    const result = await runEffect(store, contract, { identity: "g2", intent });
+    expect(result).toMatchObject({ status: "AWAITING_REVIEW", dispositionReason: { code: "APPROVAL_EXPIRED" } });
+    expect(ledger.credits).toEqual([]);
+  });
+
+  it("an approval already older than maxApprovalAgeMs when it arrives is refused", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = agedContract(ledger, 60_000);
+    const waiting = await runEffect(store, contract, { identity: "g3", intent });
+    store.time += 120_000;
+    await expect(
+      reviewEffect(store, contract, {
+        identity: "g3",
+        decision: { decision: "approved", reviewer: "A", reviewToken: waiting.reviewToken!, decidedAt: store.iso(-61_000) }
+      })
+    ).rejects.toMatchObject({ code: "APPROVAL_ALREADY_EXPIRED" });
+  });
+
+  it("within maxApprovalAgeMs the approval works as usual; an invalid maxApprovalAgeMs fails closed", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = agedContract(ledger, 60_000);
+    const waiting = await runEffect(store, contract, { identity: "g4", intent });
+    await reviewEffect(store, contract, {
+      identity: "g4",
+      decision: { decision: "approved", reviewer: "A", reviewToken: waiting.reviewToken! }
+    });
+    store.time += 59_000;
+    expect((await runEffect(store, contract, { identity: "g4", intent })).disposition).toBe("COMPLETE");
+
+    const bad = agedContract(ledger, -1);
+    const waitingBad = await runEffect(store, bad, { identity: "g5", intent });
+    await expect(
+      reviewEffect(store, bad, { identity: "g5", decision: { decision: "approved", reviewer: "A", reviewToken: waitingBad.reviewToken! } })
+    ).rejects.toThrow(/maxApprovalAgeMs/);
+    expect(ledger.count("g5")).toBe(0);
+  });
+});
