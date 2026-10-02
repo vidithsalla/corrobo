@@ -3,6 +3,7 @@ import type {
   BlockingCheck,
   OperationIdentity,
   RecordedReview,
+  ReviewEpisode,
   OperationRecord,
   OperationStatus,
   ReasonCode,
@@ -39,6 +40,8 @@ export interface NewOperationInput {
   intent: unknown;
   status: OperationStatus;
   reviewReason?: ReasonCode;
+  /** Set when the operation is created already awaiting review. */
+  reviewEpisode?: ReviewEpisode;
 }
 
 /**
@@ -50,6 +53,7 @@ export interface OperationUpdate {
   reviewReason?: ReasonCode | null;
   blockedBy?: BlockingCheck | null;
   review?: RecordedReview | null;
+  reviewEpisode?: ReviewEpisode | null;
 }
 
 /**

@@ -4,6 +4,7 @@ import { PostgresStore } from "../src/stores/postgres";
 import { OperationBusyError, reviewEffect, runEffect } from "../src/core/runtime";
 import { fingerprintIntent } from "../src/core/fingerprint";
 import { defineContract, observed, reconciled } from "../src/core/helpers";
+import { tokenOf } from "./support/review-token";
 
 const connectionString = process.env.CORROBO_TEST_DATABASE_URL;
 
@@ -72,16 +73,19 @@ describe.skipIf(!connectionString)("PostgresStore: recorded review decisions", (
   it("an approval survives a restart: the review, and the approval on the attempt it allowed, read back exactly", async () => {
     const intent = { orderId: "7" };
     const store = new PostgresStore(pool, { acknowledgePersistence: true });
-    await runEffect(store, contract, { identity: "pg-a1", intent });
-    // The review screen and the worker are different processes.
+    const waiting = await runEffect(store, contract, { identity: "pg-a1", intent });
+    const openedAt = (await store.getOperation("pg-a1"))!.reviewEpisode!.openedAt;
+    const decidedAt = new Date(Date.parse(openedAt) + 1_000).toISOString();
+    // The review screen and the worker are different processes; the screen kept the token.
     const reviewPool = new Pool({ connectionString });
     try {
       await reviewEffect(new PostgresStore(reviewPool, { acknowledgePersistence: true }), contract, {
         identity: "pg-a1",
         decision: {
           decision: "approved",
+          reviewToken: waiting.reviewToken!,
           reviewer: "alice@example.com",
-          decidedAt: "2026-10-01T11:59:00.000Z",
+          decidedAt,
           expiresAt: "2099-01-01T00:00:00.000Z",
           note: "ok"
         }
@@ -99,7 +103,7 @@ describe.skipIf(!connectionString)("PostgresStore: recorded review decisions", (
       expect(record?.review).toEqual(result.review);
       expect(record?.review).toMatchObject({
         reviewer: "alice@example.com",
-        decidedAt: "2026-10-01T11:59:00.000Z",
+        decidedAt,
         expiresAt: "2099-01-01T00:00:00.000Z",
         intentFingerprint: fingerprintIntent(contract, intent)
       });
@@ -113,7 +117,7 @@ describe.skipIf(!connectionString)("PostgresStore: recorded review decisions", (
   it("a rejection is recorded with the reviewer and reported from a fresh read", async () => {
     const store = new PostgresStore(pool, { acknowledgePersistence: true });
     await runEffect(store, contract, { identity: "pg-r1", intent: { orderId: "8" } });
-    await reviewEffect(store, contract, { identity: "pg-r1", decision: { decision: "rejected", reviewer: "carol" } });
+    await reviewEffect(store, contract, { identity: "pg-r1", decision: { decision: "rejected", reviewToken: await tokenOf(store, "pg-r1"), reviewer: "carol" } });
     const reread = await runEffect(new PostgresStore(pool, { acknowledgePersistence: true }), contract, {
       identity: "pg-r1",
       intent: { orderId: "8" }
@@ -133,12 +137,54 @@ describe.skipIf(!connectionString)("PostgresStore: recorded review decisions", (
     const lock = await new PostgresStore(otherPool, { acknowledgePersistence: true }).tryAcquireLock("pg-busy");
     try {
       await expect(
-        reviewEffect(store, contract, { identity: "pg-busy", decision: { decision: "approved", reviewer: "alice" } })
+        reviewEffect(store, contract, { identity: "pg-busy", decision: { decision: "approved", reviewToken: await tokenOf(store, "pg-busy"), reviewer: "alice" } })
       ).rejects.toBeInstanceOf(OperationBusyError);
     } finally {
       await lock?.release();
       await otherPool.end();
     }
     expect((await store.getOperation("pg-busy"))?.review).toBeUndefined();
+  });
+
+  it("review tokens persist: minted at creation, read back by another process, and a stale one is refused there", async () => {
+    const store = new PostgresStore(pool, { acknowledgePersistence: true });
+    const waiting = await runEffect(store, contract, { identity: "pg-t1", intent: { orderId: "11" } });
+    expect(waiting.reviewToken).toMatch(/^[0-9a-f]{32}$/);
+
+    const otherPool = new Pool({ connectionString });
+    try {
+      const reviewStore = new PostgresStore(otherPool, { acknowledgePersistence: true });
+      expect((await reviewStore.getOperation("pg-t1"))?.reviewEpisode).toMatchObject({ token: waiting.reviewToken, generation: 1 });
+      await expect(
+        reviewEffect(reviewStore, contract, {
+          identity: "pg-t1",
+          decision: { decision: "approved", reviewer: "A", reviewToken: "0".repeat(32) }
+        })
+      ).rejects.toMatchObject({ name: "ReviewNotAcceptedError", code: "STALE_REVIEW_TOKEN" });
+      await reviewEffect(reviewStore, contract, {
+        identity: "pg-t1",
+        decision: { decision: "approved", reviewer: "A", reviewToken: waiting.reviewToken! }
+      });
+    } finally {
+      await otherPool.end();
+    }
+    const done = await runEffect(store, contract, { identity: "pg-t1", intent: { orderId: "11" } });
+    expect(done).toMatchObject({ disposition: "COMPLETE", reviewToken: null, review: { reviewToken: waiting.reviewToken } });
+  });
+
+  it("migrate() adds review_episode to an older table; a row awaiting review there gets a token on its next run", async () => {
+    await pool.query("ALTER TABLE corrobo_operations DROP COLUMN IF EXISTS review_episode");
+    await pool.query(
+      `INSERT INTO corrobo_operations (id, operation_type, intent, status, review_reason, attempts, version)
+       VALUES ('old-waiting', 'pg/refund', '{"orderId":"12"}', 'AWAITING_REVIEW',
+               '{"code":"POLICY_REVIEW_REQUIRED","summary":"needs review"}', '[]', 1)`
+    );
+    await PostgresStore.migrate(pool);
+    const store = new PostgresStore(pool, { acknowledgePersistence: true });
+    expect((await store.getOperation("old-waiting"))?.reviewEpisode).toBeUndefined();
+    const waiting = await runEffect(store, contract, { identity: "old-waiting", intent: { orderId: "12" } });
+    expect(waiting).toMatchObject({ status: "AWAITING_REVIEW" });
+    expect(waiting.reviewToken).toMatch(/^[0-9a-f]{32}$/);
+    expect((await store.getOperation("old-waiting"))?.reviewEpisode?.token).toBe(waiting.reviewToken);
   });
 });

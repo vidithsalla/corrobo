@@ -99,6 +99,14 @@ export interface RevalidationResult {
  */
 export interface ReviewDecision {
   decision: "approved" | "rejected";
+  /**
+   * The token of the review this decision answers: `EffectResult.reviewToken` from the result
+   * that reported AWAITING_REVIEW, kept with whatever the reviewer was shown. Required. Each
+   * time an operation goes to review it gets a new token, bound to the operation, that review
+   * and the recorded intent, so a decision made on an earlier review screen can't approve a
+   * later review of the same operation.
+   */
+  reviewToken: string;
   /** Who decided, as your app identifies them (a user id, an email). Required, non-empty. */
   reviewer: string;
   /** When they decided (RFC 3339 with Z or an offset). Defaults to when corrobo records it. */
@@ -130,12 +138,28 @@ export interface RecordedReview {
   intentFingerprint: string;
   /** When corrobo recorded it, from the store's clock when it has one. */
   recordedAt: string;
+  /** The review this decision answered (ReviewEpisode.token). */
+  reviewToken: string;
   /**
    * How many attempts were recorded when the decision was. When an approval follows earlier
    * attempts, the next runEffect() re-observes the latest one before executing again: time
    * passed while the operation waited for review.
    */
   attemptCount: number;
+}
+
+/**
+ * One period of an operation awaiting review. A new one begins every time the operation goes to
+ * review (authorize() at creation, revalidate() asking for review, an approval that expired or
+ * can't be attributed), and only a decision carrying its token is accepted.
+ */
+export interface ReviewEpisode {
+  /** Opaque. Bound to this operation, this episode and the recorded intent. */
+  token: string;
+  /** 1 the first time the operation awaited review, +1 each time after. */
+  generation: number;
+  /** When this review began, from the store's clock. A decision dated earlier was made for something else. */
+  openedAt: string;
 }
 
 /** What reviewEffect() takes: which operation, and the reviewer's decision on it. */
@@ -342,6 +366,8 @@ export interface OperationRecord {
   blockedBy?: BlockingCheck;
   /** The latest review decision, when the operation went through review. */
   review?: RecordedReview;
+  /** The current (or latest) review, when the operation has awaited review. */
+  reviewEpisode?: ReviewEpisode;
   createdAt: string;
   updatedAt: string;
   /**
@@ -384,4 +410,9 @@ export interface EffectResult<Observation> {
   retryNotBefore: string | null;
   /** The latest review decision on this operation (OperationRecord.review), or null. */
   review: RecordedReview | null;
+  /**
+   * While AWAITING_REVIEW: the token a decision on this review must carry (ReviewDecision.
+   * reviewToken). Keep it with what you show the reviewer. null otherwise.
+   */
+  reviewToken: string | null;
 }
