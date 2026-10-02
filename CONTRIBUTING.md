@@ -37,7 +37,7 @@ Also useful: `npm run demo`, `npm run quickstart`, `npm run conformance`, and th
 
 **A store.** Implement `EffectStore` (see `src/core/store.ts`): same-identity locking, and version-checked writes that throw `StoreConflictError` and change nothing on a mismatch; add `now()` if the store is shared across hosts. Run the existing store and fencing tests against it.
 
-**Anything in the review flow** (`authorize()`, `revalidate()`, `reviewEffect()`, review episodes, approvals): run `tests/review-state-machine.test.ts` with more seeds (`CORROBO_MODEL_SEEDS=20000 npx vitest run tests/review-state-machine.test.ts`). If you add a state or a rule, add it to the model's actions and its oracle, and check that the model catches the bug your rule prevents (break the rule on purpose and watch it fail).
+**Anything in the review flow** (`authorize()`, `revalidate()`, `reviewEffect()`, review episodes, approvals): run `tests/review-state-machine.test.ts` with more seeds (`CORROBO_MODEL_SEEDS=20000 npx vitest run tests/review-state-machine.test.ts`). If you add a state or a rule, add it to the model's actions and its oracle (from the test's own inputs, never from corrobo's record), add a mutation that breaks your rule to `scripts/review-mutations.mjs`, and run `npm run mutations:review`: every mutation must be caught.
 
 **A conformance scenario.** Add it to `src/testing/conformance.ts`, prove a correct contract passes it, and add a known-bad contract to `tests/conformance-known-bad.test.ts` that only the new scenario catches.
 

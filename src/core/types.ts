@@ -161,11 +161,12 @@ export interface ReviewEpisode {
   /** When this review began, from the store's clock. A decision dated earlier was made for something else. */
   openedAt: string;
   /**
-   * Set when this review opened while a decision without a token (recorded by corrobo 0.4.0)
-   * was on record: that decision's recordedAt. That decision predates this review, so it never
-   * counts as answering it, even if both share a timestamp.
+   * A decision without a token (recorded by corrobo 0.4.0) that was on record when this review
+   * opened. It is moved here, out of OperationRecord.review, because it predates this review and
+   * never answers it; kept for the audit trail. Any tokenless decision on the record after that
+   * was written later, so it answers this review.
    */
-  predatesDecisionAt?: string;
+  supersededDecision?: RecordedReview;
 }
 
 /** What reviewEffect() takes: which operation, and the reviewer's decision on it. */
