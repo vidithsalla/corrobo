@@ -1168,7 +1168,12 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
     return resultFromRecord(existing);
   }
 
-  return await continueOpen(store, contract, existing, request);
+  // Act on the recorded intent: the one authorized, approved and attempted so far. With the
+  // default fingerprint a later request's intent is the same data (it fingerprinted equal to the
+  // stored JSON form), but a custom fingerprintIntent() may call two intents "equal" while
+  // ignoring fields execute() reads; a later request must never change what is executed.
+  const acting = contract.fingerprintIntent ? { ...request, intent: existing.intent as Intent } : request;
+  return await continueOpen(store, contract, existing, acting);
 }
 
 /**
