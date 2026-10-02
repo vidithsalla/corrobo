@@ -285,4 +285,18 @@ describe("Stripe refund example", () => {
     expect(client.idempotencyKeysReceived).toHaveLength(1); // found by reading, not by re-sending the key
     expect(client.createdRefundCount).toBe(1);
   });
+
+  it("the read-back pages through a charge's refunds: ours behind 150 others is still found", async () => {
+    const client = new FakeStripeClient();
+    client.seedCharge("ch_16", 1_000_000);
+    for (let i = 0; i < 150; i++) {
+      await client.refunds.create({ charge: "ch_16", amount: 100, metadata: { corrobo_operation: `other-${i}` } }, { idempotencyKey: `k-${i}` });
+    }
+    client.scheduleFault("ch_16", { createFailures: 1, mode: "afterCommit" }); // ours is created, its response lost
+    const store = new InMemoryStore();
+    const contract = createRefundContract({ client });
+    const result = await runEffect(store, contract, { identity: "refund-16", intent: { chargeId: "ch_16", amountCents: 5000 } });
+    expect(result).toMatchObject({ evidenceState: "APPLIED", disposition: "COMPLETE" });
+    expect(client.createdRefundCount).toBe(151);
+  });
 });

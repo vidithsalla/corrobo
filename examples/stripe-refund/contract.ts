@@ -104,8 +104,20 @@ export function createRefundContract(options: {
       // refund, if any, among the charge's refunds by the metadata execute() attached. Stripe's
       // list endpoint reflects writes immediately (unlike its Search API), so "not there" is a
       // real answer. A throw here becomes observation_failed -> UNKNOWN, never NOT_APPLIED.
-      const { data } = await options.client.refunds.list({ charge: intent.chargeId, limit: 100 });
-      const ours = data.find((refund) => refund.metadata?.[OPERATION_METADATA_KEY] === identity.id);
+      // Every page: a charge can carry many partial refunds, and missing ours would read as
+      // "not applied".
+      let ours: RefundLike | undefined;
+      let startingAfter: string | undefined;
+      for (;;) {
+        const page = await options.client.refunds.list({
+          charge: intent.chargeId,
+          limit: 100,
+          ...(startingAfter ? { starting_after: startingAfter } : {})
+        });
+        ours = page.data.find((refund) => refund.metadata?.[OPERATION_METADATA_KEY] === identity.id);
+        if (ours || !page.has_more || page.data.length === 0) break;
+        startingAfter = page.data[page.data.length - 1].id;
+      }
       if (ours) {
         return observationFromRefund(ours);
       }

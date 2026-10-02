@@ -35,8 +35,8 @@ export interface StripeClientLike {
       options: { idempotencyKey: string }
     ): Promise<RefundLike>;
     retrieve(id: string): Promise<RefundLike>;
-    /** Refunds on one charge (Stripe's list endpoint, not its eventually consistent Search API). */
-    list(params: { charge: string; limit?: number }): Promise<{ data: RefundLike[] }>;
+    /** Refunds on one charge, a page at a time (Stripe's list endpoint, not its eventually consistent Search API). */
+    list(params: { charge: string; limit?: number; starting_after?: string }): Promise<{ data: RefundLike[]; has_more: boolean }>;
   };
 }
 

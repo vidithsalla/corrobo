@@ -64,8 +64,8 @@ async function main(): Promise<void> {
         return toRefundLike(await stripe.refunds.retrieve(id));
       },
       async list(params) {
-        const page = await stripe.refunds.list({ charge: params.charge, limit: params.limit });
-        return { data: page.data.map(toRefundLike) };
+        const page = await stripe.refunds.list({ charge: params.charge, limit: params.limit, starting_after: params.starting_after });
+        return { data: page.data.map(toRefundLike), has_more: page.has_more };
       }
     }
   };
