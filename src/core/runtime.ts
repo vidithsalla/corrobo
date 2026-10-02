@@ -21,6 +21,7 @@ import type {
   ReviewDecision,
   ReviewEpisode,
   ReviewRequest,
+  TokenlessReview,
   ReservedAttempt,
   ResolvedAttempt,
   TransportOutcome
@@ -207,7 +208,7 @@ async function openReviewEpisode(
     .slice(0, 32);
   const episode: ReviewEpisode = { token, generation, openedAt };
   if (decisionOnRecord && typeof decisionOnRecord.reviewToken !== "string") {
-    episode.supersededDecision = decisionOnRecord;
+    episode.supersededDecision = decisionOnRecord as unknown as TokenlessReview;
   }
   return episode;
 }

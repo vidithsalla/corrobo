@@ -166,8 +166,15 @@ export interface ReviewEpisode {
    * never answers it; kept for the audit trail. Any tokenless decision on the record after that
    * was written later, so it answers this review.
    */
-  supersededDecision?: RecordedReview;
+  supersededDecision?: TokenlessReview;
 }
+
+/** A decision recorded by corrobo 0.4.0, which kept no review token (or reviewer, or attempt count, in some records). */
+export type TokenlessReview = Omit<RecordedReview, "reviewToken" | "reviewer" | "attemptCount"> & {
+  reviewToken?: undefined;
+  reviewer: string | null;
+  attemptCount?: number;
+};
 
 /** What reviewEffect() takes: which operation, and the reviewer's decision on it. */
 export interface ReviewRequest {
