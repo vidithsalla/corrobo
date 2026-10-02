@@ -167,7 +167,16 @@ export class ReviewNotAcceptedError extends Error {
 function openReview(record: OperationRecord): ReviewEpisode | null {
   const episode = record.reviewEpisode;
   if (record.status !== "AWAITING_REVIEW" || !episode) return null;
-  return record.review?.reviewToken === episode.token ? null : episode;
+  const review = record.review;
+  // Answered: a decision carries this episode's token; or, for a decision without a token (only
+  // corrobo 0.4.0 records those), it was recorded once this episode was open (both read the
+  // store's clock; a tie counts as answered, which only costs a new review, never a reused one).
+  const answered =
+    review !== undefined &&
+    (typeof review.reviewToken === "string"
+      ? review.reviewToken === episode.token
+      : Date.parse(review.recordedAt) >= Date.parse(episode.openedAt));
+  return answered ? null : episode;
 }
 
 /** The token a decision must carry right now (see openReview), or null. */

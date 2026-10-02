@@ -820,6 +820,7 @@ describe("review tokens: a decision answers one review", () => {
       },
       record!.version
     );
+    store.time += 1_000;
     const result = await runEffect(store, contract, { identity: "t4", intent });
     expect(result).toMatchObject({ status: "AWAITING_REVIEW", dispositionReason: { code: "APPROVAL_NOT_RECORDED" } });
     expect(result.reviewToken).toMatch(/^[0-9a-f]{32}$/);
@@ -865,6 +866,45 @@ describe("review tokens: a decision answers one review", () => {
         decision: { decision: "approved", reviewer: "A", reviewToken: first.reviewToken! }
       })
     ).rejects.toMatchObject({ code: "STALE_REVIEW_TOKEN" });
+    expect(ledger.credits).toEqual([]);
+  });
+
+  it("a review a 0.4.0 worker answered (no token) and then reopened can't be answered with its old token", async () => {
+    const store = new ClockStore();
+    const ledger = makeLedger();
+    const contract = makeContract(ledger);
+    const first = await runEffect(store, contract, { identity: "t6", intent });
+    store.time += 1_000;
+    // A 0.4.0 worker approves review 1 (recording no token)...
+    let record = await store.getOperation("t6");
+    await store.updateOperation(
+      "t6",
+      {
+        status: "OPEN",
+        review: {
+          decision: "approved",
+          reviewer: "B",
+          decidedAt: store.iso(),
+          intentFingerprint: fingerprintIntent(contract, intent),
+          recordedAt: store.iso(),
+          attemptCount: 0
+        } as unknown as RecordedReview
+      },
+      record!.version
+    );
+    // ...then sends it back to review without opening a new one.
+    store.time += 1_000;
+    record = await store.getOperation("t6");
+    await store.updateOperation("t6", { status: "AWAITING_REVIEW" }, record!.version);
+
+    await expect(
+      reviewEffect(store, contract, {
+        identity: "t6",
+        decision: { decision: "approved", reviewer: "A", reviewToken: first.reviewToken! }
+      })
+    ).rejects.toMatchObject({ code: "STALE_REVIEW_TOKEN" });
+    const reopened = await runEffect(store, contract, { identity: "t6", intent });
+    expect(reopened.reviewToken).not.toBe(first.reviewToken);
     expect(ledger.credits).toEqual([]);
   });
 });
