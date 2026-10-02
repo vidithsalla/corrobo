@@ -15,14 +15,14 @@ Evidence, strongest first:
 
 `scripts/adoption-snapshot.sh` records the public signals (no telemetry; corrobo never reports anything about its users).
 
-## Now (0.4.x)
+## Now (0.5.x)
 
 - Get technical critique of the failure matrix and the conformance harness from people who work on retries, idempotency and durable execution, and fix what they find.
 - Provider examples that exercise the hard cases — [#14](https://github.com/vidithsalla/corrobo/issues/14) (Linear, a lookup that can prove absence), [#15](https://github.com/vidithsalla/corrobo/issues/15) (GitHub issues, a search that can't), [#16](https://github.com/vidithsalla/corrobo/issues/16) (Stripe through the harness). Good first contributions.
 - Bug fixes and doc corrections, especially anything that overstates a guarantee.
-- Feedback on the pre-execute checks shipped in 0.4.0 (`revalidate()`, attributed approvals) from people building agent runtimes, where the approval is the safety boundary.
+- Feedback on the pre-execute checks (`revalidate()`, attributed approvals with review tokens, 0.4–0.5) from people building agent runtimes, where the approval is the safety boundary.
 
-## Next, if evidence supports it (0.5 candidates)
+## Next, if evidence supports it (0.6 candidates)
 
 | Candidate | Worth doing when |
 |---|---|
