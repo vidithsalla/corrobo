@@ -71,6 +71,11 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 6.4 | `UNKNOWN`, `PENDING`, `CONFLICTED`, `APPLIED` | Never `RETRY`, whatever the retry policy | No | T45, T102, T103, T104 |
 | 6.5 | Called again after the operation closed | Recorded result returned | No | T46, T100 |
 | 6.6 | Contract settings that would be unsafe or unfinishable (`maxInFlightMs` negative, NaN or infinite; `maxAttempts` not a positive integer; …) | `TypeError` before anything runs: no record, no `execute()` | No | T178, T179 |
+| 6.7 | `authorize()` returns something malformed (`{}`, `requiresReview: 0`, …) | `TypeError` before the operation is recorded; never treated as "no review needed" | No | T185 |
+| 6.8 | `reconcile()` throws, or returns something malformed, after `execute()` | `UNKNOWN` → `INVESTIGATE` (`RECONCILE_FAILED`), resolved and closed, instead of a `RESERVED` attempt every call throws on | No | T186 |
+| 6.9 | After `execute()`, a hook returns something the store can't copy: reason metadata with a cycle or BigInt, or an `observe()` result with a cycle, BigInt, function or Proxy, or one that isn't an observation (`null`, an unknown status, `observation_failed` without an error), or one whose getters answer differently later | The metadata is replaced by a note; the observation counts as failed (`UNKNOWN`), and what's stored is a snapshot read once; either way the attempt resolves instead of every call failing at the same write | No | T188, T189, T191, T192 |
+| 6.10 | With `PostgresStore`, hook output after `execute()` contains U+0000 or an unpaired surrogate (JSON allows them, `jsonb` doesn't) | Stored with U+FFFD in their place; the attempt resolves instead of every write being rejected. (An intent containing them is rejected at its first write, before anything runs.) | No | T193, T194 |
+| 6.11 | `observe()` itself returns `observation_failed` with an `error.raw` | `error.raw` is kept by reference, like a thrown error's (`InMemoryStore` keeps it; `PostgresStore` strips it); an `Error` used as the `error` keeps its message | No | T195, T196 |
 
 ## 7. Review
 
@@ -141,6 +146,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 9.9 | Contract supplies its own `fingerprintIntent()` | corrobo uses it and does not apply the default JSON rules to that intent; the store must still be able to persist the intent | No | T70, T111 |
 | 9.7 | A new identity | A genuinely new operation | Yes (it's new) | T75 |
 | 9.12 | Custom `fingerprintIntent()` that ignores a field `execute()` reads; a later request differs in it | Same operation; corrobo acts on the recorded (reviewed) intent, never the later request's | Only as recorded | T180 |
+| 9.13 | Custom `fingerprintIntent()`; the intent's `toJSON()` differs from the object, and a reviewer passes `fingerprintIntent(contract, intent)` of that object | The exported `fingerprintIntent()` uses the JSON form, as `runEffect()` does, so the approval matches | Once approved | T190 |
 
 ## 10. Persistence and privacy
 
@@ -168,6 +174,7 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 | 11.3 | Stable provider id known from `execute()` | Later checks look it up directly | T95 |
 | 11.4 | Lookup only by search/listing | **Assumes:** your contract returns `UNKNOWN` when absence can't be proven — see 3.4 | T30 |
 | 11.5 | An `observe()` that could create the effect (e.g. replaying the create request as its "read-back") | Not allowed: `observe()` runs where nothing may execute (crash recovery, re-checks, after an approval expired), so it must only read. The Stripe example reads only; an expired approval leads to review, not a refund | T181 |
+| 11.6 | Stripe example: an unlabeled refund of the same amount on the charge (made before refunds were labeled, or by hand) | Absence can't be proven: `UNKNOWN` (`UNLABELED_REFUND_PRESENT`), never a second refund | T187 |
 
 ## 12. What corrobo itself does on your machine
 
@@ -368,5 +375,17 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T182** [`tests/observation-history.test.ts`](../tests/observation-history.test.ts) — "a long PENDING keeps the first observation and the most recent ones, at most 20"
 - **T183** [`tests/observation-history.test.ts`](../tests/observation-history.test.ts) — "is bounded and persisted, and read back by another process"
 - **T184** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "the read-back pages through a charge's refunds: ours behind 150 others is still found"
+- **T185** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s throws before anything is recorded or executed (a malformed answer never skips review)"
+- **T186** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "reconcile() that %s after execute() records UNKNOWN / INVESTIGATE and closes, instead of throwing forever"
+- **T187** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "an unlabeled refund of the same amount (made before refunds were labeled) means absence can't be proven: UNKNOWN, no second refund"
+- **T188** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: reconcile() reason metadata with %s is recorded as a note; the attempt resolves"
+- **T189** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() data with %s counts as a failed observation (UNKNOWN), not a write that fails forever"
+- **T190** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "an approval carrying fingerprintIntent(contract, intent) of the request's own object is accepted, even when its toJSON() differs"
+- **T191** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() returning %s counts as a failed observation (UNKNOWN), not a write that fails forever"
+- **T192** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: an observation whose status getter answers differently later is stored as first read; the attempt resolves"
+- **T193** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "PostgresStore: hook output containing %s is stored with U+FFFD in its place; the attempt resolves"
+- **T194** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "PostgresStore: observe() throwing an error whose message contains U+0000 still resolves the attempt"
+- **T195** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "InMemoryStore: an error.raw that observe() returns itself is kept by reference, not copied"
+- **T196** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() returning observation_failed with an Error as its error keeps the error's message"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"

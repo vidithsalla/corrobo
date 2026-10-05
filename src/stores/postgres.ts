@@ -170,6 +170,28 @@ function sanitizeObservationForPersistence(observation: ObservationResult<unknow
   };
 }
 
+/**
+ * JSON for an attempt, as Postgres `jsonb` will take it. JSON can carry U+0000 and unpaired
+ * surrogates; `jsonb` rejects them, and an attempt's data comes from hooks after execute(), so a
+ * rejected write would fail again on every pass and leave the attempt RESERVED. They become
+ * U+FFFD. Not used for the intent: it's fingerprinted as given, and is written before anything runs.
+ */
+function jsonbText(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => {
+    if (typeof item === "string") return jsonbSafe(item);
+    if (typeof item === "object" && item !== null && !Array.isArray(item) && Object.keys(item).some((k) => jsonbSafe(k) !== k)) {
+      return Object.fromEntries(Object.entries(item).map(([k, v]) => [jsonbSafe(k), v]));
+    }
+    return item;
+  });
+}
+
+const JSONB_UNSAFE = /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+function jsonbSafe(text: string): string {
+  return text.replace(JSONB_UNSAFE, "\uFFFD");
+}
+
 function isUniqueViolation(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === "23505";
 }
@@ -255,7 +277,7 @@ async function appendAttemptImpl(
      SET attempts = attempts || $2::jsonb, status = $3, updated_at = now(), version = version + 1
      WHERE id = $1 AND version = $4
      RETURNING *`,
-    [identityId, JSON.stringify([sanitizeAttemptForPersistence(attempt)]), status, expectedVersion]
+    [identityId, jsonbText([sanitizeAttemptForPersistence(attempt)]), status, expectedVersion]
   );
   return versionedWriteResult(q, identityId, expectedVersion, result.rows[0]);
 }
@@ -275,7 +297,7 @@ async function updateLatestAttemptImpl(
          version = version + 1
      WHERE id = $1 AND version = $4 AND jsonb_array_length(attempts) > 0
      RETURNING *`,
-    [identityId, JSON.stringify(sanitizeAttemptForPersistence(attempt)), status, expectedVersion]
+    [identityId, jsonbText(sanitizeAttemptForPersistence(attempt)), status, expectedVersion]
   );
   return versionedWriteResult(
     q,

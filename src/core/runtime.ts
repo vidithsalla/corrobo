@@ -96,8 +96,8 @@ function resultForInProgress<Observation>(identity: OperationRecord["identity"])
  * The request's intent as it will be stored, read once per runEffect() call. With the default
  * fingerprint, `stored` is the plain-JSON form (see materializeIntent) and `fingerprint` is
  * computed from it, so what is fingerprinted is exactly what is persisted. With a contract's own
- * fingerprintIntent(), the intent is stored as given and fingerprinted lazily, only when there
- * is an existing record to compare against.
+ * fingerprintIntent(), `stored` is the intent's JSON form, which every hook then acts on (see
+ * runEffect), and it is fingerprinted lazily, only when there is an existing record to compare.
  */
 interface PreparedIntent {
   stored: unknown;
@@ -106,7 +106,16 @@ interface PreparedIntent {
 
 function prepareIntent<Intent>(contract: EffectContract<Intent, unknown, unknown>, intent: Intent): PreparedIntent {
   if (contract.fingerprintIntent) {
-    return { stored: intent, fingerprint: null };
+    // Stored, and acted on in every call (the first one too), as its JSON form, so authorize(),
+    // execute() and later calls all see exactly what was recorded, in either store.
+    let json: string | undefined;
+    try {
+      json = JSON.stringify(intent);
+    } catch (err) {
+      throw new TypeError(`corrobo: the intent can't be stored as JSON (${errorMessage(err)}); nothing was run.`);
+    }
+    if (json === undefined) throw new TypeError("corrobo: the intent can't be stored as JSON (it is undefined); nothing was run.");
+    return { stored: JSON.parse(json), fingerprint: null };
   }
   const stored = materializeIntent(intent);
   return { stored, fingerprint: canonicalStringify(stored) };
@@ -339,6 +348,89 @@ function assertSameLogicalOperation<Intent>(
   }
 }
 
+/**
+ * authorize()'s answer, checked: anything but `{ requiresReview: boolean, reason?: ReasonCode }`
+ * throws before the operation is recorded, so a malformed answer can never skip review.
+ */
+function validAuthorization(result: unknown): { requiresReview: boolean; reason?: ReasonCode } {
+  let requiresReview: unknown;
+  let reason: unknown;
+  let storedReason: ReasonCode | undefined;
+  try {
+    if (typeof result === "object" && result !== null) ({ requiresReview, reason } = result as Record<string, unknown>);
+    if (reason !== undefined) storedReason = storableReason(reason);
+  } catch (err) {
+    throw new TypeError(`corrobo: authorize() returned a result that can't be read (${errorMessage(err)}); nothing was recorded or executed.`);
+  }
+  if (typeof requiresReview !== "boolean") {
+    throw new TypeError(
+      "corrobo: authorize() must return { requiresReview: true | false }; it returned something else, so nothing was recorded or executed."
+    );
+  }
+  if (reason !== undefined && !storedReason) {
+    throw new TypeError("corrobo: authorize() returned a reason without a string code and summary; nothing was recorded or executed.");
+  }
+  return storedReason === undefined ? { requiresReview } : { requiresReview, reason: storedReason };
+}
+
+const INVALID_REASON = Symbol("invalid reason");
+
+const EVIDENCE_STATES: readonly EvidenceState[] = ["APPLIED", "NOT_APPLIED", "CONFLICTED", "PENDING", "UNKNOWN"];
+
+/**
+ * reconcile() is caught here: it runs after execute(), so a throw (or an answer that isn't one)
+ * must not leave the attempt RESERVED forever, with every later call throwing at the same place.
+ * It becomes UNKNOWN (so INVESTIGATE), honestly: corrobo can't tell what happened.
+ */
+function safeReconcile(
+  contract: EffectContract<any, any, any, any>,
+  input: { intent: unknown; transport: TransportOutcome<unknown>; observation: ObservationResult<unknown> }
+): { evidenceState: EvidenceState; reason: ReasonCode; observedEffect?: unknown } {
+  try {
+    const result: unknown = contract.reconcile(input);
+    const { evidenceState, reason, observedEffect } = (result ?? {}) as Record<string, unknown>;
+    const storedReason = storableReason(reason);
+    if (!EVIDENCE_STATES.includes(evidenceState as EvidenceState) || !storedReason) {
+      return reconcileFailed("reconcile() returned no valid evidence state and reason.");
+    }
+    return {
+      evidenceState: evidenceState as EvidenceState,
+      reason: storedReason,
+      ...(observedEffect !== undefined ? { observedEffect } : {})
+    };
+  } catch (err) {
+    return reconcileFailed(`reconcile() threw: ${errorMessage(err)}.`);
+  }
+}
+
+function reconcileFailed(summary: string): { evidenceState: EvidenceState; reason: ReasonCode } {
+  return {
+    evidenceState: "UNKNOWN",
+    reason: { code: "RECONCILE_FAILED", summary: `${summary} What happened can't be established from it; investigate.` }
+  };
+}
+
+/**
+ * A hook's reason, read once and stored as plain data: a getter or Proxy can't answer differently
+ * later, and metadata JSON can't store (a cycle, a BigInt) is replaced by a note instead of making
+ * the write fail. Undefined if it isn't a reason (no string code and summary).
+ */
+function storableReason(value: unknown): ReasonCode | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { code, summary, metadata } = value as Record<string, unknown>;
+  if (typeof code !== "string" || typeof summary !== "string") return undefined;
+  if (metadata === undefined) return { code, summary };
+  const stored = jsonCopy(metadata);
+  return {
+    code,
+    summary,
+    metadata:
+      typeof stored === "object" && stored !== null && !Array.isArray(stored)
+        ? (stored as Record<string, unknown>)
+        : { unstorable: "this reason's metadata can't be stored as a JSON object, so it was left out" }
+  };
+}
+
 /** execute() is caught here — a throw or timeout becomes transport evidence, never an uncaught rejection. */
 async function safeExecute<Intent, Evidence>(
   contract: EffectContract<Intent, unknown, Evidence>,
@@ -354,23 +446,71 @@ async function safeExecute<Intent, Evidence>(
   }
 }
 
-/** observe() is caught here — a throw becomes observation_failed, never UNKNOWN by accident being skipped. */
+function isObservation(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const { status, error } = value as { status?: unknown; error?: unknown };
+  if (status === "observed" || status === "pending") return true;
+  return (
+    status === "observation_failed" &&
+    typeof error === "object" &&
+    error !== null &&
+    typeof (error as { message?: unknown }).message === "string"
+  );
+}
+
+/** A copy of observe()'s result read once, with any error.raw set aside (see safeObserve). */
+function snapshotObservation(observation: unknown): { stored: unknown; raw: { present: boolean; value?: unknown } } {
+  if (typeof observation !== "object" || observation === null) return { stored: observation, raw: { present: false } };
+  const top: Record<string, unknown> = { ...(observation as Record<string, unknown>) };
+  let raw: { present: boolean; value?: unknown } = { present: false };
+  if (typeof top.error === "object" && top.error !== null) {
+    // An Error's message isn't enumerable, so a spread alone would lose it.
+    const error: Record<string, unknown> = { ...(top.error as Record<string, unknown>), message: (top.error as { message?: unknown }).message };
+    if ("raw" in error) {
+      raw = { present: true, value: error.raw };
+      delete error.raw;
+    }
+    top.error = error;
+  }
+  return { stored: structuredClone(top), raw };
+}
+
+/**
+ * observe() is caught here — a throw becomes observation_failed, never UNKNOWN by accident being
+ * skipped. reconcile() gets what observe() returned; the attempt stores `stored`, a snapshot taken
+ * once and checked, so a getter can't answer differently at the write.
+ */
 async function safeObserve<Intent, Observation, Evidence>(
   contract: EffectContract<Intent, Observation, Evidence>,
   intent: Intent,
   identity: OperationRecord["identity"],
   transport: TransportOutcome<Evidence>,
   attemptStartedAt: string
-): Promise<ObservationResult<Observation>> {
+): Promise<{ observation: ObservationResult<Observation>; stored: ObservationResult<unknown> }> {
   try {
-    return await contract.observe({ intent, identity, transport, attemptStartedAt });
+    const observation = await contract.observe({ intent, identity, transport, attemptStartedAt });
+    // If it isn't an observation, or a store can't copy it (JSON for Postgres, structured clone in
+    // memory), every pass would fail at that write and leave the attempt RESERVED, so it counts as
+    // a failed observation (UNKNOWN) instead.
+    // An error.raw it returns is the caller's own error, kept by reference like a thrown one
+    // (InMemoryStore keeps it, PostgresStore strips it), so it's set aside rather than copied.
+    const { stored, raw } = snapshotObservation(observation);
+    if (!isObservation(stored)) {
+      throw new Error(
+        'observe() returned no valid observation (status "observed", "pending" or "observation_failed" with an error message)'
+      );
+    }
+    JSON.stringify(stored);
+    if (raw.present) (stored as { error: { raw?: unknown } }).error.raw = raw.value;
+    return { observation, stored: stored as ObservationResult<unknown> };
   } catch (err) {
-    return {
+    const failed: ObservationResult<Observation> = {
       status: "observation_failed",
       error: { message: errorMessage(err), raw: err },
       source: contract.operationType,
       observedAt: nowIso()
     };
+    return { observation: failed, stored: failed as ObservationResult<unknown> };
   }
 }
 
@@ -668,14 +808,14 @@ async function performAttempt<Intent, Observation, Evidence>(
   const reservedRecord = await store.reserveAttempt(identity.id, reserved, base.version);
 
   const transport = await safeExecute(contract, intent, identity, attemptNumber);
-  const observation = await safeObserve(contract, intent, identity, transport, startedAt);
-  const reconciliation = contract.reconcile({ intent, transport, observation });
+  const { observation, stored } = await safeObserve(contract, intent, identity, transport, startedAt);
+  const reconciliation = safeReconcile(contract, { intent, transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
     reserved,
     transport as TransportOutcome<unknown>,
-    [observation as ObservationResult<unknown>],
+    [stored],
     reconciliation,
     await safetyNow(store)
   );
@@ -779,14 +919,6 @@ const REVALIDATION_DEFAULT_REASONS: Record<RevalidationOutcome, ReasonCode> = {
 
 type RevalidationOutcome = "proceed" | "requiresReview" | "reject";
 
-function isReasonCode(value: unknown): value is ReasonCode {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as ReasonCode).code === "string" &&
-    typeof (value as ReasonCode).summary === "string"
-  );
-}
 
 function revalidationFailed(summary: string): Pick<PreExecuteCheck, "outcome" | "reason"> {
   return {
@@ -820,10 +952,7 @@ async function runRevalidate<Intent, Context>(
     // Read each field once, inside the try: a throwing getter fails closed like a throw.
     if (typeof result === "object" && result !== null) {
       ({ decision, reason } = result as { decision?: unknown; reason?: unknown });
-      if (typeof reason === "object" && reason !== null) {
-        const { code, summary, metadata } = reason as ReasonCode;
-        reason = metadata === undefined ? { code, summary } : { code, summary, metadata };
-      }
+      if (reason !== undefined) reason = storableReason(reason) ?? INVALID_REASON;
     }
   } catch (err) {
     return revalidationFailed(`revalidate() threw: ${errorMessage(err)}.`);
@@ -831,10 +960,10 @@ async function runRevalidate<Intent, Context>(
   if (decision !== "proceed" && decision !== "requiresReview" && decision !== "reject") {
     return revalidationFailed(`revalidate() returned no valid decision (expected "proceed", "requiresReview" or "reject").`);
   }
-  if (reason !== undefined && !isReasonCode(reason)) {
+  if (reason === INVALID_REASON) {
     return revalidationFailed(`revalidate() returned a reason without a string code and summary.`);
   }
-  return { outcome: decision, reason: reason ?? REVALIDATION_DEFAULT_REASONS[decision] };
+  return { outcome: decision, reason: (reason as ReasonCode | undefined) ?? REVALIDATION_DEFAULT_REASONS[decision] };
 }
 
 /**
@@ -944,14 +1073,14 @@ async function recoverReservedAttempt<Intent, Observation, Evidence>(
     }
   };
 
-  const observation = await safeObserve(contract, intent, record.identity, transport, reserved.startedAt);
-  const reconciliation = contract.reconcile({ intent, transport, observation });
+  const { observation, stored } = await safeObserve(contract, intent, record.identity, transport, reserved.startedAt);
+  const reconciliation = safeReconcile(contract, { intent, transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
     reserved,
     transport as TransportOutcome<unknown>,
-    [observation as ObservationResult<unknown>],
+    [stored],
     reconciliation,
     await safetyNow(store)
   );
@@ -978,14 +1107,14 @@ async function reObserve<Intent, Observation, Evidence>(
   latest: ResolvedAttempt
 ): Promise<OperationRecord> {
   const transport = latest.transport as TransportOutcome<Evidence>;
-  const observation = await safeObserve(contract, intent, record.identity, transport, latest.startedAt);
-  const reconciliation = contract.reconcile({ intent, transport, observation });
+  const { observation, stored } = await safeObserve(contract, intent, record.identity, transport, latest.startedAt);
+  const reconciliation = safeReconcile(contract, { intent, transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
     latest,
     latest.transport,
-    boundedObservations([...latest.observations, observation as ObservationResult<unknown>]),
+    boundedObservations([...latest.observations, stored]),
     reconciliation,
     await safetyNow(store)
   );
@@ -1020,6 +1149,10 @@ export async function runEffect<Intent, Observation, Evidence, Context = unknown
   // faithfully as JSON is rejected here, before anything else happens — never after an effect.
   // A contract-supplied fingerprintIntent() takes responsibility for its own intents instead.
   const prepared = prepareIntent(contract, request.intent);
+  // With a custom fingerprint, every hook acts on the stored (JSON) form, from the first call on.
+  if (contract.fingerprintIntent) {
+    (request as { intent: Intent }).intent = prepared.stored as Intent;
+  }
   const lock = await store.tryAcquireLock(request.identity.id);
   if (!lock) {
     const existing = await store.getOperation(request.identity.id);
@@ -1146,7 +1279,7 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
 
   if (!existing) {
     const auth = contract.authorize
-      ? await contract.authorize(request.intent, { identity: { ...request.identity }, context: request.context })
+      ? validAuthorization(await contract.authorize(request.intent, { identity: { ...request.identity }, context: request.context }))
       : { requiresReview: false };
     const initialStatus: OperationStatus = auth.requiresReview ? "AWAITING_REVIEW" : "OPEN";
     const created = await store.createOperation({
