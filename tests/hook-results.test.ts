@@ -329,4 +329,22 @@ describe("hook output that can't be stored doesn't strand an attempt", () => {
     const attempt = (await store.getOperation("w1"))!.attempts[0] as { observations: { error: { raw: unknown } }[] };
     expect(attempt.observations[0].error.raw).toBe(raw);
   });
+
+  it.each(storeCases())("%s: observe() returning observation_failed with an Error as its error keeps the error's message", async (_store, makeStore) => {
+    const executed: string[] = [];
+    const store = await makeStore();
+    let seen: string | undefined;
+    const contract = {
+      ...base(executed),
+      observe: async () => ({ status: "observation_failed", error: new Error("503 from provider"), source: "s", observedAt: new Date().toISOString() }) as never,
+      reconcile: ({ observation }: { observation: { status: string; error?: { message: string } } }) => {
+        seen = observation.error?.message;
+        return reconciled("UNKNOWN", "U", "u");
+      }
+    };
+    const result = await runEffect(store, contract, { identity: "e1", intent: { n: 1 } });
+    expect(seen).toBe("503 from provider");
+    const attempt = result.attempts[0] as { observations: { error: { message: string } }[] };
+    expect(attempt.observations[0].error.message).toBe("503 from provider");
+  });
 });

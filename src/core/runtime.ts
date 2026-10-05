@@ -464,7 +464,8 @@ function snapshotObservation(observation: unknown): { stored: unknown; raw: { pr
   const top: Record<string, unknown> = { ...(observation as Record<string, unknown>) };
   let raw: { present: boolean; value?: unknown } = { present: false };
   if (typeof top.error === "object" && top.error !== null) {
-    const error: Record<string, unknown> = { ...(top.error as Record<string, unknown>) };
+    // An Error's message isn't enumerable, so a spread alone would lose it.
+    const error: Record<string, unknown> = { ...(top.error as Record<string, unknown>), message: (top.error as { message?: unknown }).message };
     if ("raw" in error) {
       raw = { present: true, value: error.raw };
       delete error.raw;

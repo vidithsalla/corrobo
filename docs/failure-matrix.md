@@ -75,7 +75,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 6.8 | `reconcile()` throws, or returns something malformed, after `execute()` | `UNKNOWN` → `INVESTIGATE` (`RECONCILE_FAILED`), resolved and closed, instead of a `RESERVED` attempt every call throws on | No | T186 |
 | 6.9 | After `execute()`, a hook returns something the store can't copy: reason metadata with a cycle or BigInt, or an `observe()` result with a cycle, BigInt, function or Proxy, or one that isn't an observation (`null`, an unknown status, `observation_failed` without an error), or one whose getters answer differently later | The metadata is replaced by a note; the observation counts as failed (`UNKNOWN`), and what's stored is a snapshot read once; either way the attempt resolves instead of every call failing at the same write | No | T188, T189, T191, T192 |
 | 6.10 | With `PostgresStore`, hook output after `execute()` contains U+0000 or an unpaired surrogate (JSON allows them, `jsonb` doesn't) | Stored with U+FFFD in their place; the attempt resolves instead of every write being rejected. (An intent containing them is rejected at its first write, before anything runs.) | No | T193, T194 |
-| 6.11 | `observe()` itself returns `observation_failed` with an `error.raw` | `error.raw` is kept by reference, like a thrown error's (`InMemoryStore` keeps it; `PostgresStore` strips it) | No | T195 |
+| 6.11 | `observe()` itself returns `observation_failed` with an `error.raw` | `error.raw` is kept by reference, like a thrown error's (`InMemoryStore` keeps it; `PostgresStore` strips it); an `Error` used as the `error` keeps its message | No | T195, T196 |
 
 ## 7. Review
 
@@ -386,5 +386,6 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T193** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "PostgresStore: hook output containing %s is stored with U+FFFD in its place; the attempt resolves"
 - **T194** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "PostgresStore: observe() throwing an error whose message contains U+0000 still resolves the attempt"
 - **T195** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "InMemoryStore: an error.raw that observe() returns itself is kept by reference, not copied"
+- **T196** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() returning observation_failed with an Error as its error keeps the error's message"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"
