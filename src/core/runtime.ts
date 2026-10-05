@@ -458,30 +458,39 @@ function isObservation(value: unknown): boolean {
   );
 }
 
-/** observe() is caught here — a throw becomes observation_failed, never UNKNOWN by accident being skipped. */
+/**
+ * observe() is caught here — a throw becomes observation_failed, never UNKNOWN by accident being
+ * skipped. reconcile() gets what observe() returned; the attempt stores `stored`, a snapshot taken
+ * once and checked, so a getter can't answer differently at the write.
+ */
 async function safeObserve<Intent, Observation, Evidence>(
   contract: EffectContract<Intent, Observation, Evidence>,
   intent: Intent,
   identity: OperationRecord["identity"],
   transport: TransportOutcome<Evidence>,
   attemptStartedAt: string
-): Promise<ObservationResult<Observation>> {
+): Promise<{ observation: ObservationResult<Observation>; stored: ObservationResult<unknown> }> {
   try {
     const observation = await contract.observe({ intent, identity, transport, attemptStartedAt });
-    // It is stored with the attempt: if it isn't an observation, or a store can't copy it (JSON for
-    // Postgres, structured clone in memory), every pass would fail at that write and leave the
-    // attempt RESERVED, so it counts as a failed observation (UNKNOWN) instead.
-    if (!isObservation(observation)) throw new Error("observe() returned no valid observation (status \"observed\", \"pending\" or \"observation_failed\" with an error message)");
-    JSON.stringify(observation);
-    structuredClone(observation);
-    return observation;
+    // If it isn't an observation, or a store can't copy it (JSON for Postgres, structured clone in
+    // memory), every pass would fail at that write and leave the attempt RESERVED, so it counts as
+    // a failed observation (UNKNOWN) instead.
+    const stored: unknown = structuredClone(observation);
+    if (!isObservation(stored)) {
+      throw new Error(
+        'observe() returned no valid observation (status "observed", "pending" or "observation_failed" with an error message)'
+      );
+    }
+    JSON.stringify(stored);
+    return { observation, stored: stored as ObservationResult<unknown> };
   } catch (err) {
-    return {
+    const failed: ObservationResult<Observation> = {
       status: "observation_failed",
       error: { message: errorMessage(err), raw: err },
       source: contract.operationType,
       observedAt: nowIso()
     };
+    return { observation: failed, stored: failed as ObservationResult<unknown> };
   }
 }
 
@@ -779,14 +788,14 @@ async function performAttempt<Intent, Observation, Evidence>(
   const reservedRecord = await store.reserveAttempt(identity.id, reserved, base.version);
 
   const transport = await safeExecute(contract, intent, identity, attemptNumber);
-  const observation = await safeObserve(contract, intent, identity, transport, startedAt);
+  const { observation, stored } = await safeObserve(contract, intent, identity, transport, startedAt);
   const reconciliation = safeReconcile(contract, { intent, transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
     reserved,
     transport as TransportOutcome<unknown>,
-    [observation as ObservationResult<unknown>],
+    [stored],
     reconciliation,
     await safetyNow(store)
   );
@@ -1044,14 +1053,14 @@ async function recoverReservedAttempt<Intent, Observation, Evidence>(
     }
   };
 
-  const observation = await safeObserve(contract, intent, record.identity, transport, reserved.startedAt);
+  const { observation, stored } = await safeObserve(contract, intent, record.identity, transport, reserved.startedAt);
   const reconciliation = safeReconcile(contract, { intent, transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
     reserved,
     transport as TransportOutcome<unknown>,
-    [observation as ObservationResult<unknown>],
+    [stored],
     reconciliation,
     await safetyNow(store)
   );
@@ -1078,14 +1087,14 @@ async function reObserve<Intent, Observation, Evidence>(
   latest: ResolvedAttempt
 ): Promise<OperationRecord> {
   const transport = latest.transport as TransportOutcome<Evidence>;
-  const observation = await safeObserve(contract, intent, record.identity, transport, latest.startedAt);
+  const { observation, stored } = await safeObserve(contract, intent, record.identity, transport, latest.startedAt);
   const reconciliation = safeReconcile(contract, { intent, transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
     latest,
     latest.transport,
-    boundedObservations([...latest.observations, observation as ObservationResult<unknown>]),
+    boundedObservations([...latest.observations, stored]),
     reconciliation,
     await safetyNow(store)
   );

@@ -247,4 +247,31 @@ describe("hook output that can't be stored doesn't strand an attempt", () => {
     expect(result.attempts[0].status).toBe("RESOLVED");
     expect(executed).toEqual(["v1"]);
   });
+
+  it.each(storeCases())("%s: an observation whose status getter answers differently later is stored as first read; the attempt resolves", async (_store, makeStore) => {
+    const executed: string[] = [];
+    const store = await makeStore();
+    let reads = 0;
+    const contract = {
+      ...base(executed),
+      observe: async () =>
+        ({
+          get status() {
+            reads++;
+            if (reads > 1) throw new Error("read twice");
+            return "observed";
+          },
+          data: 1,
+          authoritative: true,
+          source: "s",
+          observedAt: new Date().toISOString()
+        }) as never,
+      reconcile: () => reconciled("APPLIED", "A", "a")
+    };
+    const result = await runEffect(store, contract, { identity: "g1", intent: { n: 1 } });
+    expect(result).toMatchObject({ status: "CLOSED", disposition: "COMPLETE" });
+    expect(result.attempts[0].status).toBe("RESOLVED");
+    expect((result.attempts[0] as { observations: { status: string }[] }).observations[0].status).toBe("observed");
+    expect(executed).toEqual(["g1"]);
+  });
 });
