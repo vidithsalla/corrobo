@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.1 — 2026-10-02
+## 0.5.1 — 2026-10-05
 
 Fixes from a round of independent review: an adversarial attacker review, an operator review, and a model-based test of the review flow with its own oracle. No breaking API changes. Custom stores should persist the new `ReservedAttemptInput.maxInFlightMs`, the same way as `check`. Drain 0.5.0 workers first, and don't shorten any contract's `maxInFlightMs` in the same deploy: attempts 0.5.0 left mid-flight have no recorded window, so they settle with the current one; let them finish first. An operation awaiting a review that 0.5.0 opened while a 0.4.0 decision was still on record gets a new review token once, on its next `runEffect()`; a decision made with the old token is refused (`STALE_REVIEW_TOKEN`) and needs the new one.
 
