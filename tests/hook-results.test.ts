@@ -274,4 +274,59 @@ describe("hook output that can't be stored doesn't strand an attempt", () => {
     expect((result.attempts[0] as { observations: { status: string }[] }).observations[0].status).toBe("observed");
     expect(executed).toEqual(["g1"]);
   });
+
+  it.each<[string, string]>([
+    ["U+0000", "a\u0000b"],
+    ["an unpaired surrogate", "a\uD800b"]
+  ])("PostgresStore: hook output containing %s is stored with U+FFFD in its place; the attempt resolves", async (_label, text) => {
+    if (!connectionString) return;
+    const executed: string[] = [];
+    const store = await pgStore();
+    const contract = {
+      ...base(executed),
+      observe: async () => observed({ text, [text]: 1 }, { source: text, authoritative: true }),
+      reconcile: () => ({ evidenceState: "APPLIED" as const, reason: { code: "A", summary: text, metadata: { text } }, observedEffect: { text } })
+    };
+    const result = await runEffect(store, contract, { identity: "u1", intent: { n: 1 } });
+    expect(result).toMatchObject({ status: "CLOSED", disposition: "COMPLETE" });
+    const attempt = (await store.getOperation("u1"))!.attempts[0] as { status: string; observations: { data: unknown }[]; evidenceReason: { summary: string } };
+    expect(attempt.status).toBe("RESOLVED");
+    expect(attempt.evidenceReason.summary).toBe("a\uFFFDb");
+    expect(attempt.observations[0].data).toEqual({ text: "a\uFFFDb", "a\uFFFDb": 1 });
+    expect(executed).toEqual(["u1"]);
+  });
+
+  it("PostgresStore: observe() throwing an error whose message contains U+0000 still resolves the attempt", async () => {
+    if (!connectionString) return;
+    const executed: string[] = [];
+    const store = await pgStore();
+    const contract = {
+      ...base(executed),
+      observe: async () => {
+        throw new Error("down\u0000");
+      },
+      reconcile: () => reconciled("UNKNOWN", "U", "u")
+    };
+    const result = await runEffect(store, contract, { identity: "u2", intent: { n: 1 } });
+    expect(result).toMatchObject({ status: "CLOSED", disposition: "INVESTIGATE" });
+    expect((await store.getOperation("u2"))!.attempts[0].status).toBe("RESOLVED");
+  });
+
+  it("InMemoryStore: an error.raw that observe() returns itself is kept by reference, not copied", async () => {
+    class HttpError extends Error {
+      config = { url: "https://example.test" };
+    }
+    const raw = new HttpError("503");
+    const executed: string[] = [];
+    const store = new InMemoryStore();
+    const contract = {
+      ...base(executed),
+      observe: async () =>
+        ({ status: "observation_failed", error: { message: "503", raw }, source: "s", observedAt: new Date().toISOString() }) as never,
+      reconcile: () => reconciled("UNKNOWN", "U", "u")
+    };
+    await runEffect(store, contract, { identity: "w1", intent: { n: 1 } });
+    const attempt = (await store.getOperation("w1"))!.attempts[0] as { observations: { error: { raw: unknown } }[] };
+    expect(attempt.observations[0].error.raw).toBe(raw);
+  });
 });

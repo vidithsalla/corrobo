@@ -458,6 +458,22 @@ function isObservation(value: unknown): boolean {
   );
 }
 
+/** A copy of observe()'s result read once, with any error.raw set aside (see safeObserve). */
+function snapshotObservation(observation: unknown): { stored: unknown; raw: { present: boolean; value?: unknown } } {
+  if (typeof observation !== "object" || observation === null) return { stored: observation, raw: { present: false } };
+  const top: Record<string, unknown> = { ...(observation as Record<string, unknown>) };
+  let raw: { present: boolean; value?: unknown } = { present: false };
+  if (typeof top.error === "object" && top.error !== null) {
+    const error: Record<string, unknown> = { ...(top.error as Record<string, unknown>) };
+    if ("raw" in error) {
+      raw = { present: true, value: error.raw };
+      delete error.raw;
+    }
+    top.error = error;
+  }
+  return { stored: structuredClone(top), raw };
+}
+
 /**
  * observe() is caught here — a throw becomes observation_failed, never UNKNOWN by accident being
  * skipped. reconcile() gets what observe() returned; the attempt stores `stored`, a snapshot taken
@@ -475,13 +491,16 @@ async function safeObserve<Intent, Observation, Evidence>(
     // If it isn't an observation, or a store can't copy it (JSON for Postgres, structured clone in
     // memory), every pass would fail at that write and leave the attempt RESERVED, so it counts as
     // a failed observation (UNKNOWN) instead.
-    const stored: unknown = structuredClone(observation);
+    // An error.raw it returns is the caller's own error, kept by reference like a thrown one
+    // (InMemoryStore keeps it, PostgresStore strips it), so it's set aside rather than copied.
+    const { stored, raw } = snapshotObservation(observation);
     if (!isObservation(stored)) {
       throw new Error(
         'observe() returned no valid observation (status "observed", "pending" or "observation_failed" with an error message)'
       );
     }
     JSON.stringify(stored);
+    if (raw.present) (stored as { error: { raw?: unknown } }).error.raw = raw.value;
     return { observation, stored: stored as ObservationResult<unknown> };
   } catch (err) {
     const failed: ObservationResult<Observation> = {
