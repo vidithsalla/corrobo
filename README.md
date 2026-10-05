@@ -7,7 +7,9 @@
 
 Your code issued a refund, sent a message, opened a ticket, or merged a PR, and the connection dropped before the answer came back. Maybe it failed. Maybe the provider did it and only the response got lost. Retry blindly and you might do it twice.
 
-corrobo is a small TypeScript library for that moment. It records the operation before making the call, then asks the external system what actually happened, and decides from that evidence whether doing it again is safe.
+corrobo is a small TypeScript library for that moment. It records the operation before making the call, then asks the external system what actually happened, and decides from that evidence whether to do it again.
+
+For actions an agent shouldn't take alone, it can also require a person's sign-off first. The approval answers one review, can expire, and is checked again before every retry ([human review](#human-review-before-an-action)).
 
 ```
 execute  →  observe  →  reconcile  →  recover
@@ -15,7 +17,7 @@ execute  →  observe  →  reconcile  →  recover
 
 ![npm run demo: after a lost response, the naive retry credits the account twice; corrobo checks the ledger and credits once](https://raw.githubusercontent.com/vidithsalla/corrobo/main/docs/assets/timeout-after-write.svg)
 
-That's `npm run demo` in this repo: a real local HTTP ledger commits a credit, then drops the connection. Both counts come from the ledger's own API, not from corrobo.
+That's `npm run demo` in this repo (clone it, then `npm ci && npm run demo`; no API keys or services needed): a real local HTTP ledger commits a credit, then drops the connection. Both counts come from the ledger's own API, not from corrobo.
 
 ```
 npm install corrobo
@@ -91,13 +93,15 @@ Two answers, kept separate on purpose: what the evidence shows, and what's safe 
 | `PENDING` | Accepted, not final yet | none yet: call again later; while it stays `PENDING`, corrobo re-checks instead of re-executing |
 | `UNKNOWN` | It couldn't find out | `INVESTIGATE`, never a blind retry |
 
-Plus `REVIEW`: an optional `authorize()` hook can require human sign-off *before* anything is executed; a reviewer can approve or reject. The result that reports `AWAITING_REVIEW` carries a `reviewToken`; keep it with what you show the reviewer. Your review screen records the decision with `reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer, reviewToken, expiresAt } })`, which never executes anything, and your worker's next `runEffect()` acts on it. A decision records who made it and when, can carry an expiry (and a contract's `maxApprovalAgeMs` caps how old any approval may be), and answers exactly one review: a decision made on an earlier review's screen, or dated before the current review began, is refused. corrobo checks the approval again before every attempt it allows ([spec §M](docs/v0.1-spec.md#m-review-decisions)).
+**Requests can land late.** A timed-out request isn't undone, it's just unanswered, and it can still be applied after corrobo first looks. So when a failed call is followed by `NOT_APPLIED` while that request could still land, the `RETRY` comes with a `retryNotBefore` time (your declared `maxInFlightMs` after the attempt started): calling earlier does nothing, and calling after it makes corrobo check once more before it executes again. If you don't declare `maxInFlightMs`, the answer is `INVESTIGATE`. Details: [spec §O](docs/v0.1-spec.md#o-fencing-and-settlement-when-the-lock-is-not-enough).
+
+## Human review before an action
+
+An optional `authorize()` hook can require human sign-off *before* anything is executed (the `REVIEW` disposition); a reviewer can approve or reject. The result that reports `AWAITING_REVIEW` carries a `reviewToken`; keep it with what you show the reviewer. Your review screen records the decision with `reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer, reviewToken, expiresAt } })`, which never executes anything, and your worker's next `runEffect()` acts on it. A decision records who made it and when, can carry an expiry (and a contract's `maxApprovalAgeMs` caps how old any approval may be), and answers exactly one review: a decision made on an earlier review's screen, or dated before the current review began, is refused. corrobo checks the approval again before every attempt it allows ([spec §M](docs/v0.1-spec.md#m-review-decisions)).
 
 `runEffect()` takes no decision at all, so code that only makes attempts can't approve them. That's an API boundary, not a privilege boundary: any code with the same store and contract can call `reviewEffect()` and name any reviewer. It lets you separate the capabilities (run `reviewEffect()` only in your review service, under its own database role, behind your own authentication), but it doesn't do that for you. Never expose it to anything a model can call.
 
 **Checking again before each attempt.** An approval given now, or a retry an hour from now, can act on a world that has changed: the order was cancelled, the agent's scope was revoked. An optional `revalidate()` hook runs right before every attempt, including the first, with the current caller's `context`, and can let it `proceed`, send it to `requiresReview`, or `reject` it (`REPLAN`). It never blocks corrobo from finding out what an earlier attempt did, and if it throws, nothing runs. It narrows the gap between checking and acting but can't close it, so use the provider's conditional writes too where it has them. Details: [spec §M.1](docs/v0.1-spec.md#m1-revalidation-before-each-attempt).
-
-**Requests can land late.** A timed-out request isn't undone, it's just unanswered, and it can still be applied after corrobo first looks. So when a failed call is followed by `NOT_APPLIED` while that request could still land, the `RETRY` comes with a `retryNotBefore` time (your declared `maxInFlightMs` after the attempt started): calling earlier does nothing, and calling after it makes corrobo check once more before it executes again. If you don't declare `maxInFlightMs`, the answer is `INVESTIGATE`. Details: [spec §O](docs/v0.1-spec.md#o-fencing-and-settlement-when-the-lock-is-not-enough).
 
 ## Test your contract
 
