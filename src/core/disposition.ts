@@ -85,7 +85,8 @@ export function decideDisposition(input: DecideDispositionInput): DecideDisposit
         reason: reason(
           "RETRY_NOT_SAFE_OR_EXHAUSTED",
           "The effect did not occur, but retry is exhausted or not permitted for this operation type.",
-          { attemptNumber, maxAttempts: retryPolicy.maxAttempts, retryable }
+          // JSON (and so PostgresStore) can't hold Infinity; record an unlimited policy as such.
+          { attemptNumber, maxAttempts: Number.isFinite(retryPolicy.maxAttempts) ? retryPolicy.maxAttempts : "unlimited", retryable }
         )
       };
     }

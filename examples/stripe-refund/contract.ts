@@ -14,7 +14,7 @@ export type RefundTransportEvidence =
 
 export type RefundObservationData =
   | { exists: true; refundId: string; status: RefundLike["status"]; amount: number }
-  | { exists: false; rejectionCode?: string; rejectionMessage?: string };
+  | { exists: false; rejectionCode?: string; rejectionMessage?: string; unlabeledSameAmount?: string };
 
 /**
  * The Corrobo operation identity IS the logical refund. The Stripe Idempotency-Key is
@@ -110,6 +110,7 @@ export function createRefundContract(options: {
       // Every page: a charge can carry many partial refunds, and missing ours would read as
       // "not applied".
       let ours: RefundLike | undefined;
+      let unlabeledSameAmount: RefundLike | undefined;
       let startingAfter: string | undefined;
       for (let pages = 0; ; pages++) {
         // A provider (or a bug) that keeps returning has_more would otherwise loop here forever,
@@ -121,6 +122,12 @@ export function createRefundContract(options: {
           ...(startingAfter ? { starting_after: startingAfter } : {})
         });
         ours = page.data.find((refund) => refund.metadata?.[OPERATION_METADATA_KEY] === identity.id);
+        // A refund of the same amount without our label could be this operation's, sent before
+        // refunds were labeled (by corrobo 0.5.0's version of this example), or by hand: its
+        // presence means absence can't be proven.
+        unlabeledSameAmount ??= page.data.find(
+          (refund) => refund.metadata?.[OPERATION_METADATA_KEY] === undefined && refund.amount === intent.amountCents
+        );
         if (ours || !page.has_more || page.data.length === 0) break;
         startingAfter = page.data[page.data.length - 1].id;
       }
@@ -130,8 +137,13 @@ export function createRefundContract(options: {
       const rejection = transport.ok && transport.evidence.kind === "rejected" ? transport.evidence : undefined;
       return {
         status: "observed",
-        data: { exists: false, rejectionCode: rejection?.code, rejectionMessage: rejection?.message },
-        authoritative: true,
+        data: {
+          exists: false,
+          rejectionCode: rejection?.code,
+          rejectionMessage: rejection?.message,
+          ...(unlabeledSameAmount ? { unlabeledSameAmount: unlabeledSameAmount.id } : {})
+        },
+        authoritative: unlabeledSameAmount === undefined,
         source: "stripe:refunds.list",
         observedAt: nowIso()
       };
@@ -163,6 +175,17 @@ export function createRefundContract(options: {
       const data = observation.data;
 
       if (!data.exists) {
+        if (!observation.authoritative) {
+          return {
+            evidenceState: "UNKNOWN",
+            reason: {
+              code: "UNLABELED_REFUND_PRESENT",
+              summary:
+                "No refund carries this operation's label, but the charge has an unlabeled refund of the same amount, which could be this operation's (sent before refunds were labeled). Check it before refunding again.",
+              metadata: { refundId: data.unlabeledSameAmount }
+            }
+          };
+        }
         if (isConflictCode(data.rejectionCode)) {
           return {
             evidenceState: "CONFLICTED",

@@ -43,7 +43,7 @@ const store = new PostgresStore(pool, { acknowledgePersistence: true });
 
 - **Drain old workers before new ones serve traffic,** and don't run two corrobo versions against one table. Each release's upgrade notes in the [changelog](../CHANGELOG.md) say what changes.
 - **Don't roll back from 0.5 to 0.4.0** if you use review. 0.4.0 ignores review tokens and `maxApprovalAgeMs`, so it would accept a decision made for an earlier review again (the bug 0.5.0 fixed). 0.4.0 is deprecated on npm.
-- **Changing a contract during a rolling deploy.** An attempt records the `maxInFlightMs` it was sent under, and settlement never uses a shorter one. Other changes (`observe()`, `reconcile()`, `fingerprintIntent()`, the retry policy) apply to operations already open. If a change is incompatible with them, give the new contract a new `operationType` and let the old operations finish under the old one.
+- **Changing a contract during a rolling deploy.** An attempt records the `maxInFlightMs` it was sent under, and settlement never uses a shorter one (attempts made before 0.5.1 have no recorded window, so don't shorten it in the deploy that upgrades to 0.5.1). Other changes (`observe()`, `reconcile()`, `fingerprintIntent()`, the retry policy) apply to operations already open. If a change is incompatible with them, give the new contract a new `operationType` and let the old operations finish under the old one.
 
 ## Retention: never delete what can still be retried
 

@@ -173,4 +173,12 @@ describe("contract validation keeps what 0.5.0 accepted", () => {
     expect(result.disposition).toBe("RETRY");
     expect(executed).toEqual(["v3"]);
   });
+
+  it("an unlimited maxAttempts is recorded as \"unlimited\" in the reason, so every store keeps the same value", async () => {
+    const executed: string[] = [];
+    const contract = { ...baseContract(executed), retryPolicy: { maxAttempts: Number.POSITIVE_INFINITY, retryOnNotApplied: false } };
+    const result = await runEffect(new InMemoryStore(), contract, { identity: "v4", intent: { n: 1 } });
+    expect(result.disposition).toBe("INVESTIGATE");
+    expect(result.dispositionReason.metadata).toMatchObject({ maxAttempts: "unlimited", retryable: false });
+  });
 });
