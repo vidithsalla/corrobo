@@ -73,7 +73,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 6.6 | Contract settings that would be unsafe or unfinishable (`maxInFlightMs` negative, NaN or infinite; `maxAttempts` not a positive integer; …) | `TypeError` before anything runs: no record, no `execute()` | No | T178, T179 |
 | 6.7 | `authorize()` returns something malformed (`{}`, `requiresReview: 0`, …) | `TypeError` before the operation is recorded; never treated as "no review needed" | No | T185 |
 | 6.8 | `reconcile()` throws, or returns something malformed, after `execute()` | `UNKNOWN` → `INVESTIGATE` (`RECONCILE_FAILED`), resolved and closed, instead of a `RESERVED` attempt every call throws on | No | T186 |
-| 6.9 | After `execute()`, a hook returns something the store can't copy: reason metadata with a cycle or BigInt, or an `observe()` result with a cycle, BigInt, function or Proxy | The metadata is replaced by a note; the observation counts as failed (`UNKNOWN`); either way the attempt resolves instead of every call failing at the same write | No | T188, T189 |
+| 6.9 | After `execute()`, a hook returns something the store can't copy: reason metadata with a cycle or BigInt, or an `observe()` result with a cycle, BigInt, function or Proxy, or one that isn't an observation (`null`, an unknown status, `observation_failed` without an error) | The metadata is replaced by a note; the observation counts as failed (`UNKNOWN`); either way the attempt resolves instead of every call failing at the same write | No | T188, T189, T191 |
 
 ## 7. Review
 
@@ -379,5 +379,6 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T188** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: reconcile() reason metadata with %s is recorded as a note; the attempt resolves"
 - **T189** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() data with %s counts as a failed observation (UNKNOWN), not a write that fails forever"
 - **T190** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "an approval carrying fingerprintIntent(contract, intent) of the request's own object is accepted, even when its toJSON() differs"
+- **T191** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() returning %s counts as a failed observation (UNKNOWN), not a write that fails forever"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"

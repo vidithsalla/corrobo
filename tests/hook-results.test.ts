@@ -163,6 +163,18 @@ function unstorableCases(): [string, () => unknown][] {
   ];
 }
 
+/** observe() answers that aren't observations at all. */
+function malformedObservations(): [string, unknown][] {
+  return [
+    ["null", null],
+    ["undefined", undefined],
+    ["{}", {}],
+    ["a string", "observed"],
+    ["an unknown status", { status: "done", data: 1, authoritative: true, source: "s", observedAt: "t" }],
+    ["observation_failed without an error", { status: "observation_failed", source: "s", observedAt: "t" }]
+  ];
+}
+
 function storeCases(): [string, () => Promise<EffectStore>][] {
   const cases: [string, () => Promise<EffectStore>][] = [["InMemoryStore", async () => new InMemoryStore()]];
   if (connectionString) cases.push(["PostgresStore", async () => pgStore()]);
@@ -215,5 +227,24 @@ describe("hook output that can't be stored doesn't strand an attempt", () => {
     expect(result).toMatchObject({ status: "CLOSED", evidenceState: "UNKNOWN", disposition: "INVESTIGATE" });
     expect(result.attempts[0].status).toBe("RESOLVED");
     expect(executed).toEqual(["o1"]);
+  });
+
+  const malformed = storeCases().flatMap(([storeName, makeStore]) =>
+    malformedObservations().map(([label, value]) => [storeName, label, makeStore, value] as const)
+  );
+
+  it.each(malformed)("%s: observe() returning %s counts as a failed observation (UNKNOWN), not a write that fails forever", async (_store, _label, makeStore, value) => {
+    const executed: string[] = [];
+    const store = await makeStore();
+    const contract = {
+      ...base(executed),
+      observe: async () => value as never,
+      reconcile: ({ observation }: { observation: { status: string } }) =>
+        observation.status === "observation_failed" ? reconciled("UNKNOWN", "U", "u") : reconciled("APPLIED", "A", "a")
+    };
+    const result = await runEffect(store, contract, { identity: "v1", intent: { n: 1 } });
+    expect(result).toMatchObject({ status: "CLOSED", evidenceState: "UNKNOWN", disposition: "INVESTIGATE" });
+    expect(result.attempts[0].status).toBe("RESOLVED");
+    expect(executed).toEqual(["v1"]);
   });
 });

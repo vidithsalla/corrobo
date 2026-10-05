@@ -446,6 +446,18 @@ async function safeExecute<Intent, Evidence>(
   }
 }
 
+function isObservation(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const { status, error } = value as { status?: unknown; error?: unknown };
+  if (status === "observed" || status === "pending") return true;
+  return (
+    status === "observation_failed" &&
+    typeof error === "object" &&
+    error !== null &&
+    typeof (error as { message?: unknown }).message === "string"
+  );
+}
+
 /** observe() is caught here — a throw becomes observation_failed, never UNKNOWN by accident being skipped. */
 async function safeObserve<Intent, Observation, Evidence>(
   contract: EffectContract<Intent, Observation, Evidence>,
@@ -456,9 +468,10 @@ async function safeObserve<Intent, Observation, Evidence>(
 ): Promise<ObservationResult<Observation>> {
   try {
     const observation = await contract.observe({ intent, identity, transport, attemptStartedAt });
-    // It is stored with the attempt: if a store can't copy it (JSON for Postgres, structured clone
-    // in memory), every pass would fail at that write and leave the attempt RESERVED, so it counts
-    // as a failed observation (UNKNOWN) instead. observe() must return plain data.
+    // It is stored with the attempt: if it isn't an observation, or a store can't copy it (JSON for
+    // Postgres, structured clone in memory), every pass would fail at that write and leave the
+    // attempt RESERVED, so it counts as a failed observation (UNKNOWN) instead.
+    if (!isObservation(observation)) throw new Error("observe() returned no valid observation (status \"observed\", \"pending\" or \"observation_failed\" with an error message)");
     JSON.stringify(observation);
     structuredClone(observation);
     return observation;
