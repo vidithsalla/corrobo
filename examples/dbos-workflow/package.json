@@ -7,7 +7,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@dbos-inc/dbos-sdk": "5.2.11",
+    "@dbos-inc/dbos-sdk": "5.4.0",
     "corrobo": "file:../..",
     "pg": "^8.13.1"
   },
