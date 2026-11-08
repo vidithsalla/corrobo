@@ -29,7 +29,8 @@ function refundContract(payments: PaymentsApi) {
       if (observation.status !== "observed") return reconciled("UNKNOWN", "NO_READ", "Couldn't look the refund up.");
       const refunds = observation.data;
       if (refunds.length === 0) return reconciled("NOT_APPLIED", "NO_REFUND", "No refund exists.");
-      if (refunds.length === 1 && refunds[0].amountCents === intent.amountCents) {
+      const [refund] = refunds;
+      if (refunds.length === 1 && refund.chargeId === intent.chargeId && refund.amountCents === intent.amountCents) {
         return reconciled("APPLIED", "REFUNDED", "The refund exists.");
       }
       return reconciled("CONFLICTED", "UNEXPECTED", "Refunds don't match the plan.");
