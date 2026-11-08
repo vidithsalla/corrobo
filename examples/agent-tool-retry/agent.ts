@@ -1,7 +1,8 @@
 /**
  * A simulated agent turn, standing in for a model so this runs offline. It behaves like the worst
  * case: it calls the refund tool, and on anything other than a success it calls it again, with a
- * new tool call id. With "Please try again" as the error text, real models did this in 6 of 6 runs
+ * new tool call id. With "Please try again" as the error text, a smaller model (Claude Haiku 5.5)
+ * did this in 6 of 6 runs and a larger one (Sonnet 5.5) in 0 of 4
  * (https://github.com/openai/openai-agents-js/issues/2184).
  */
 export type RefundArgs = { chargeId: string; amountCents: number };

@@ -2,7 +2,7 @@
 
 `npm run example:agent-retry` (offline; the model is simulated).
 
-A refund tool's request times out after the refund went through. Shown the default error text ("Please try again"), real models call the tool again: 6 of 6 runs issued the refund twice in [this experiment](https://github.com/openai/openai-agents-js/issues/2184). The retry is a **new tool call, with a new `toolCallId`**.
+A refund tool's request times out after the refund went through. Shown the default error text ("Please try again"), a model can call the tool again: in [this experiment](https://github.com/openai/openai-agents-js/issues/2184), a smaller model (Claude Haiku 5.5) issued the refund twice in 6 of 6 runs, while a larger one (Sonnet 5.5) checked first and didn't (0 of 4). So it depends on the model, which is the point: the tool shouldn't have to rely on it. When it happens, the retry is a **new tool call, with a new `toolCallId`**.
 
 | Tool | Refunds made |
 |---|---|
