@@ -91,6 +91,7 @@ export class InMemoryStore implements EffectStore {
       intent: input.intent,
       status: input.status,
       reviewReason: input.reviewReason,
+      ...(input.reviewEpisode ? { reviewEpisode: input.reviewEpisode } : {}),
       attempts: [],
       createdAt: now,
       updatedAt: now,
@@ -111,7 +112,8 @@ export class InMemoryStore implements EffectStore {
         attemptNumber: reserved.attemptNumber,
         startedAt: reserved.startedAt,
         updatedAt: reserved.startedAt,
-        ...(reserved.check ? { check: reserved.check } : {})
+        ...(reserved.check ? { check: reserved.check } : {}),
+        ...(reserved.maxInFlightMs !== undefined ? { maxInFlightMs: reserved.maxInFlightMs } : {})
       });
     });
   }
@@ -157,6 +159,10 @@ export class InMemoryStore implements EffectStore {
       if (update.review !== undefined) {
         if (update.review === null) delete record.review;
         else record.review = update.review;
+      }
+      if (update.reviewEpisode !== undefined) {
+        if (update.reviewEpisode === null) delete record.reviewEpisode;
+        else record.reviewEpisode = update.reviewEpisode;
       }
     });
   }

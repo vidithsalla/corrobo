@@ -3,6 +3,7 @@ import { InMemoryStore } from "../src/stores/memory";
 import { reviewEffect, runEffect } from "../src/core/runtime";
 import { createRefundContract, idempotencyKeyFor } from "../examples/stripe-refund/contract";
 import { FakeStripeClient } from "../examples/stripe-refund/fake-stripe-client";
+import { tokenOf } from "./support/review-token";
 
 describe("Stripe refund example", () => {
   it("normal success -> APPLIED / COMPLETE", async () => {
@@ -38,12 +39,7 @@ describe("Stripe refund example", () => {
     expect(client.createdRefundCount).toBe(1);
   });
 
-  it("timeout BEFORE Stripe ever processes the request self-heals in one call via the idempotency replay", async () => {
-    // Unlike a plain REST API with no native idempotency, a timeout before Stripe saw the
-    // request and a timeout after it committed both flow through the SAME observe() replay
-    // path here — and Stripe's own idempotency semantics (cache-or-create) resolve the
-    // ambiguity authoritatively. The caller never needs to distinguish the two: this call
-    // both discovers nothing was created yet AND safely creates it, in one run() call.
+  it("timeout BEFORE Stripe ever processes the request: observe() only reads and finds nothing; the retry with the same key creates exactly one refund", async () => {
     const client = new FakeStripeClient();
     client.seedCharge("ch_3", 5000);
     client.scheduleFault("ch_3", { createFailures: 1, mode: "beforeCommit" });
@@ -53,14 +49,45 @@ describe("Stripe refund example", () => {
     const intent = { chargeId: "ch_3", amountCents: 5000 };
 
     const r1 = await runEffect(store, contract, { identity, intent });
-    expect(r1.evidenceState).toBe("APPLIED");
-    expect(r1.disposition).toBe("COMPLETE");
-    expect(client.createdRefundCount).toBe(1);
+    expect(r1).toMatchObject({ evidenceState: "NOT_APPLIED", disposition: "RETRY" });
+    expect(client.createdRefundCount).toBe(0); // observing created nothing
 
     const r2 = await runEffect(store, contract, { identity, intent });
-    expect(r2.disposition).toBe("COMPLETE");
-    expect(r2.attempts).toHaveLength(1);
+    expect(r2).toMatchObject({ evidenceState: "APPLIED", disposition: "COMPLETE" });
+    expect(r2.attempts).toHaveLength(2);
     expect(client.createdRefundCount).toBe(1);
+    expect(new Set(client.idempotencyKeysReceived)).toEqual(new Set([idempotencyKeyFor("refund-3")]));
+  });
+
+  it("observe() never creates a refund: an approval that expired while the request was lost leads to review, not a refund", async () => {
+    // The adversarial-review finding: observe() runs where nothing may be executed (crash
+    // recovery, the re-check before a retry, after an approval expired). It used to replay
+    // create-refund, which created the refund whenever the original request had been lost.
+    const client = new FakeStripeClient();
+    client.seedCharge("ch_3b", 2_000_000);
+    client.scheduleFault("ch_3b", { createFailures: 1, mode: "beforeCommit" });
+    let now = Date.parse("2026-10-02T12:00:00.000Z");
+    class ClockStore extends InMemoryStore {
+      async now() {
+        return new Date(now);
+      }
+    }
+    const store = new ClockStore();
+    const contract = { ...createRefundContract({ client, reviewThresholdCents: 1_000_000 }), maxApprovalAgeMs: 60_000 };
+    const identity = "refund-3b";
+    const intent = { chargeId: "ch_3b", amountCents: 2_000_000 };
+
+    const waiting = await runEffect(store, contract, { identity, intent });
+    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer: "ops", reviewToken: waiting.reviewToken! } });
+    const lost = await runEffect(store, contract, { identity, intent }); // the request never reaches Stripe
+    expect(lost).toMatchObject({ evidenceState: "NOT_APPLIED", disposition: "RETRY" });
+
+    now += 61_000; // the approval ages out
+    const readsBefore = client.reads;
+    const after = await runEffect(store, contract, { identity, intent });
+    expect(after).toMatchObject({ status: "AWAITING_REVIEW", dispositionReason: { code: "APPROVAL_EXPIRED" } });
+    expect(client.reads).toBeGreaterThan(readsBefore); // it did re-check Stripe, by reading
+    expect(client.createdRefundCount).toBe(0); // and created nothing
   });
 
   it("a definitive rejection that is NOT a state conflict (e.g. an invalid charge) is NOT_APPLIED, safely retryable once fixed", async () => {
@@ -95,12 +122,11 @@ describe("Stripe refund example", () => {
     await runEffect(store, contract, { identity, intent });
 
     const record = await store.getOperation("refund-4");
-    const latest = record?.attempts[0];
-    expect(latest?.status).toBe("RESOLVED");
-    const observations = latest && latest.status === "RESOLVED" ? latest.observations : [];
-    const refundId =
-      (observations[0] as { data?: { refundId?: string } })?.data?.refundId ??
-      (observations[observations.length - 1] as { data?: { refundId?: string } })?.data?.refundId;
+    expect(record?.attempts.map((a) => a.status)).toEqual(["RESOLVED", "RESOLVED"]); // a failed create, then a retry
+    const observations = (record?.attempts ?? []).flatMap((a) => (a.status === "RESOLVED" ? a.observations : []));
+    const refundId = observations
+      .map((o) => (o as { data?: { refundId?: string } }).data?.refundId)
+      .find((id) => id !== undefined);
     expect(refundId).toBeDefined();
     expect(client.getRefundState(refundId as string)).toBeDefined();
     // A single Stripe key was ever used for this logical operation, and it produced one refund.
@@ -136,10 +162,10 @@ describe("Stripe refund example", () => {
     expect(client.createdRefundCount).toBe(1);
   });
 
-  it("observation failure (execute and the idempotency-replay both ambiguous) -> UNKNOWN / INVESTIGATE", async () => {
+  it("observation failure (execute and the read-back both ambiguous) -> UNKNOWN / INVESTIGATE", async () => {
     const client = new FakeStripeClient();
     client.seedCharge("ch_6", 5000);
-    client.scheduleFault("ch_6", { createFailures: 2, mode: "beforeCommit" });
+    client.scheduleFault("ch_6", { createFailures: 1, mode: "beforeCommit", listFailures: 1 });
     const store = new InMemoryStore();
     const contract = createRefundContract({ client });
     const result = await runEffect(store, contract, {
@@ -219,74 +245,79 @@ describe("Stripe refund example", () => {
     expect(r1.evidenceState).toBeNull();
     expect(client.createdRefundCount).toBe(0);
 
-    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer: "reviewer@example.com" } });
+    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewToken: await tokenOf(store, identity), reviewer: "reviewer@example.com" } });
 
     const r2 = await runEffect(store, contract, { identity, intent });
     expect(r2.disposition).toBe("COMPLETE");
     expect(client.createdRefundCount).toBe(1);
   });
 
-  describe("idempotency-key replay safety window", () => {
-    it("replay observation inside the safe window resolves normally", async () => {
-      const client = new FakeStripeClient();
-      client.seedCharge("ch_12", 5000);
-      client.scheduleFault("ch_12", { createFailures: 1, mode: "beforeCommit" });
-      const store = new InMemoryStore();
-      // A generous window: the fake execute()/observe() pair here completes in milliseconds.
-      const contract = createRefundContract({ client, idempotencyReplaySafeWindowMs: 60_000 });
-      const identity = { id: "refund-12", operationType: contract.operationType };
-      const intent = { chargeId: "ch_12", amountCents: 5000 };
+  it("once execute() itself returns a stable refund id, later re-observations retrieve it directly", async () => {
+    const client = new FakeStripeClient();
+    client.seedCharge("ch_14", 5000, { convergeAsync: true }); // no fault: execute() succeeds directly
+    const store = new InMemoryStore();
+    const contract = createRefundContract({ client });
+    const identity = { id: "refund-14", operationType: contract.operationType };
+    const intent = { chargeId: "ch_14", amountCents: 5000 };
 
-      const result = await runEffect(store, contract, { identity, intent });
-      expect(result.evidenceState).toBe("APPLIED");
-      expect(result.disposition).toBe("COMPLETE");
-      expect(client.createdRefundCount).toBe(1);
-    });
+    const first = await runEffect(store, contract, { identity, intent });
+    expect(first.evidenceState).toBe("PENDING");
+    expect(client.createdRefundCount).toBe(1);
 
-    it("replay beyond the safe window is refused — UNKNOWN/INVESTIGATE, no second refund ever created", async () => {
-      const client = new FakeStripeClient();
-      // convergeAsync so the first (in-window) replay creates a real but still-PENDING refund,
-      // exercising the exact re-observation path that keeps re-attempting replay over time.
-      client.seedCharge("ch_13", 5000, { convergeAsync: true });
-      client.scheduleFault("ch_13", { createFailures: 1, mode: "beforeCommit" });
-      const store = new InMemoryStore();
-      const contract = createRefundContract({ client, idempotencyReplaySafeWindowMs: 30 });
-      const identity = { id: "refund-13", operationType: contract.operationType };
-      const intent = { chargeId: "ch_13", amountCents: 5000 };
+    await new Promise((resolve) => setTimeout(resolve, 200));
 
-      const first = await runEffect(store, contract, { identity, intent });
-      expect(first.evidenceState).toBe("PENDING");
-      expect(client.createdRefundCount).toBe(1); // the in-window replay created exactly one refund
+    const second = await runEffect(store, contract, { identity, intent });
+    expect(second.evidenceState).toBe("APPLIED");
+    expect(second.disposition).toBe("COMPLETE");
+    expect(second.observation?.source).toBe("stripe:refunds");
+    expect(client.createdRefundCount).toBe(1);
+  });
 
-      await new Promise((resolve) => setTimeout(resolve, 60)); // now past the 30ms safe window
+  it("a lost response long after the attempt is still found by its metadata: no reliance on the idempotency key's retention", async () => {
+    const client = new FakeStripeClient();
+    client.seedCharge("ch_15", 5000);
+    client.scheduleFault("ch_15", { createFailures: 1, mode: "afterCommit" }); // created, response lost
+    const store = new InMemoryStore();
+    const contract = createRefundContract({ client });
+    const result = await runEffect(store, contract, { identity: "refund-15", intent: { chargeId: "ch_15", amountCents: 5000 } });
+    expect(result).toMatchObject({ evidenceState: "APPLIED", disposition: "COMPLETE" });
+    expect(result.observation?.source).toBe("stripe:refunds");
+    expect(client.idempotencyKeysReceived).toHaveLength(1); // found by reading, not by re-sending the key
+    expect(client.createdRefundCount).toBe(1);
+  });
 
-      const second = await runEffect(store, contract, { identity, intent });
-      expect(second.evidenceState).toBe("UNKNOWN");
-      expect(second.disposition).toBe("INVESTIGATE");
-      expect(client.createdRefundCount).toBe(1); // refusing to replay meant no second refund was created
-    });
+  it("the read-back pages through a charge's refunds: ours behind 150 others is still found", async () => {
+    const client = new FakeStripeClient();
+    client.seedCharge("ch_16", 1_000_000);
+    for (let i = 0; i < 150; i++) {
+      await client.refunds.create({ charge: "ch_16", amount: 100, metadata: { corrobo_operation: `other-${i}` } }, { idempotencyKey: `k-${i}` });
+    }
+    client.scheduleFault("ch_16", { createFailures: 1, mode: "afterCommit" }); // ours is created, its response lost
+    const store = new InMemoryStore();
+    const contract = createRefundContract({ client });
+    const result = await runEffect(store, contract, { identity: "refund-16", intent: { chargeId: "ch_16", amountCents: 5000 } });
+    expect(result).toMatchObject({ evidenceState: "APPLIED", disposition: "COMPLETE" });
+    expect(client.createdRefundCount).toBe(151);
+  });
 
-    it("once execute() itself returns a stable refund id, later re-observations use direct retrieve, never replay", async () => {
-      const client = new FakeStripeClient();
-      client.seedCharge("ch_14", 5000, { convergeAsync: true }); // no fault: execute() succeeds directly
-      const store = new InMemoryStore();
-      const contract = createRefundContract({ client, idempotencyReplaySafeWindowMs: 30 });
-      const identity = { id: "refund-14", operationType: contract.operationType };
-      const intent = { chargeId: "ch_14", amountCents: 5000 };
-
-      const first = await runEffect(store, contract, { identity, intent });
-      expect(first.evidenceState).toBe("PENDING");
-      expect(client.createdRefundCount).toBe(1);
-
-      // Well past the replay-safety window — if re-observation used replay, this would refuse
-      // and report UNKNOWN. Because execute() returned a stable id, observation uses direct
-      // retrieve instead, which has no expiry, and correctly resolves once convergence finishes.
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      const second = await runEffect(store, contract, { identity, intent });
-      expect(second.evidenceState).toBe("APPLIED");
-      expect(second.disposition).toBe("COMPLETE");
-      expect(client.createdRefundCount).toBe(1);
-    });
+  it("a list that never ends (has_more forever) gives up after a bounded number of pages: UNKNOWN, no hang", async () => {
+    const client = new FakeStripeClient();
+    client.seedCharge("ch_17", 5000);
+    client.scheduleFault("ch_17", { createFailures: 1, mode: "beforeCommit" });
+    let listCalls = 0;
+    const endless = {
+      refunds: {
+        ...client.refunds,
+        list: async () => {
+          listCalls += 1;
+          return { data: [{ id: "re_other", status: "succeeded" as const, amount: 1, charge: "ch_17", metadata: { corrobo_operation: "someone-else" } }], has_more: true };
+        }
+      }
+    };
+    const contract = createRefundContract({ client: endless });
+    const result = await runEffect(new InMemoryStore(), contract, { identity: "refund-17", intent: { chargeId: "ch_17", amountCents: 5000 } });
+    expect(result).toMatchObject({ evidenceState: "UNKNOWN", disposition: "INVESTIGATE" });
+    expect(listCalls).toBe(50);
+    expect(client.createdRefundCount).toBe(0);
   });
 });

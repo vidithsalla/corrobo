@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { InMemoryStore } from "../src/stores/memory";
 import { reviewEffect, runEffect } from "../src/core/runtime";
 import type { EffectContract, ObservationResult, ReconciliationResult, RetryPolicy } from "../src/core/types";
+import { tokenOf } from "./support/review-token";
 
 interface TestIntent {
   [key: string]: unknown;
@@ -94,7 +95,7 @@ describe("runEffect", () => {
     expect(r1.evidenceState).toBeNull();
     expect(getExecuteCalls()).toBe(0);
 
-    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer: "reviewer@example.com" } });
+    await reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewToken: await tokenOf(store, identity), reviewer: "reviewer@example.com" } });
 
     const r2 = await runEffect(store, contract, { identity, intent: {} });
     expect(r2.disposition).toBe("COMPLETE");

@@ -1,7 +1,7 @@
 {
   "name": "corrobo",
-  "version": "0.4.0",
-  "description": "Safe retries for external side effects: when a timeout or crash leaves you unsure whether a write happened, check the real system before doing it again.",
+  "version": "0.5.1",
+  "description": "When an API call times out, check whether the write happened before retrying it. Human approvals for agent actions, tied to one review. TypeScript, zero dependencies.",
   "license": "MIT",
   "homepage": "https://github.com/vidithsalla/corrobo#readme",
   "repository": {
@@ -80,6 +80,8 @@
     "example:jev": "tsx examples/jev-refund/demo.ts",
     "example:jev:live": "tsx examples/jev-refund/live.ts",
     "example:action-table": "tsx examples/action-table/demo.ts",
+    "example:agent-retry": "tsx examples/agent-tool-retry/demo.ts",
+    "mutations:review": "node scripts/review-mutations.mjs",
     "verify": "npm run typecheck && npm run test && npm run build"
   },
   "devDependencies": {

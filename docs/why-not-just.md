@@ -20,7 +20,7 @@ Checked against current official docs on 2026-09-29.
 
 **Where ambiguity remains:** Some APIs have no keys. Some keys expire. Some keys are scoped to one HTTP request, not a business operation. Async outcomes can remain PENDING. Audit still asks "what happened?" not merely "what did replay return?" Stripe also does not save a result before endpoint execution starts, such as validation failure or concurrent conflict.
 
-**How corrobo composes with it:** Use the provider key, derived from corrobo's stable operation identity so every attempt of one operation sends the same key. corrobo then observes the authoritative state after execution and records APPLIED / NOT_APPLIED / CONFLICTED / PENDING / UNKNOWN. The [Stripe example](../examples/stripe-refund) does exactly this, and its contract also refuses to replay a key past a conservative margin inside Stripe's retention window, reporting UNKNOWN instead of risking a second refund.
+**How corrobo composes with it:** Use the provider key, derived from corrobo's stable operation identity so every attempt of one operation sends the same key. corrobo then observes the authoritative state after execution and records APPLIED / NOT_APPLIED / CONFLICTED / PENDING / UNKNOWN. The [Stripe example](../examples/stripe-refund) does exactly this. Its read-back only reads: it looks the refund up by id, or by the operation id it attached as metadata, so it never depends on the key's retention and never re-sends the request.
 
 ## 3. Why not just use Temporal?
 

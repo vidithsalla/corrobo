@@ -108,7 +108,10 @@ export function fingerprintIntent<Intent>(
   intent: Intent
 ): string {
   if (contract.fingerprintIntent) {
-    return contract.fingerprintIntent(intent);
+    // runEffect() records, and fingerprints, a custom-fingerprint intent's JSON form; so does this.
+    const json = JSON.stringify(intent);
+    if (json === undefined) throw new TypeError("corrobo: the intent can't be fingerprinted as JSON (it is undefined).");
+    return contract.fingerprintIntent(JSON.parse(json) as Intent);
   }
   return canonicalStringify(intent);
 }

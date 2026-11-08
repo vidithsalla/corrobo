@@ -18,7 +18,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 1.4 | Request lands **late**, after corrobo first looked | Applied, but later | First `NOT_APPLIED` → `RETRY` (deferred); the re-check before retrying finds `APPLIED` → `COMPLETE` | No | No | Call again after `retryNotBefore` | T7, T8 |
 | 1.5 | Transport failure, contract declares no `maxInFlightMs` | Unknown whether it will land | `NOT_APPLIED` → `INVESTIGATE` (`IN_FLIGHT_NOT_RULED_OUT`) | No | No | Decide manually, or declare `maxInFlightMs` | T9, T10 |
 | 1.6 | `execute()` returned a response, but the effect isn't there | Not applied, request finished | `NOT_APPLIED` → `RETRY` immediately (per retry policy) | Yes, once | No | Nothing | T13, T42 |
-| 1.7 | Transport failure with provider-side idempotency | Either; the provider deduplicates | The contract sends one key on every attempt and in its read-back, so a replay returns the original result instead of a second effect; with `maxInFlightMs: 0` the retry decision is immediate | Possibly, deduplicated by the provider | No, within the provider's key retention | Keep the key stable per operation. **Assumes:** the provider really deduplicates on it | T14, T15, T92 |
+| 1.7 | Transport failure with provider-side idempotency | Either; the provider deduplicates | The contract sends one key on every attempt, so a retry while the first request is still in flight returns the original result instead of a second effect; its read-back only reads (it never re-sends the request); with `maxInFlightMs: 0` the retry decision is immediate | Possibly, deduplicated by the provider | No, within the provider's key retention | Keep the key stable per operation. **Assumes:** the provider really deduplicates on it | T14, T15, T92 |
 
 ## 2. Crash boundaries
 
@@ -33,6 +33,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 2.7 | `execute()` succeeds but returns data the store can't serialize (e.g. circular SDK object in Postgres) | Effect applied | That pass throws; the reservation survives; the next run observes: `APPLIED` → `COMPLETE` | No | No | Run again; return plain data from `execute()` | T23 |
 | 2.8 | Process restart with `PostgresStore` | — | Operation, intent and evidence reload from Postgres | — | — | Nothing | T24, T34 |
 | 2.9 | Process restart with `InMemoryStore` | — | Every record is gone; corrobo no longer knows the operation was attempted | Yes — it looks new | **Yes** | Use `PostgresStore` wherever a restart matters | T101 |
+| 2.10 | Crash mid-attempt, then a deploy shortens `maxInFlightMs` before recovery | The crashed request can still land within the window it was sent under | The attempt records the window it was sent under; recovery never settles it with a shorter one, so the retry waits for the original window and the re-check then finds a late landing | Not before the original window | No | Run again | T177 |
 
 ## 3. Observation failures
 
@@ -51,6 +52,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 4.2 | `PENDING` → `APPLIED` | Applied | `APPLIED` → `COMPLETE`, same attempt | No | No | Nothing | T33, T34 |
 | 4.3 | `PENDING` → provider rejected it | Not applied, request finished | `NOT_APPLIED` → `RETRY` per policy (one new attempt), or `INVESTIGATE` if not retryable | Once, if policy allows | No | Nothing / investigate | T35, T36 |
 | 4.4 | Concurrent callers while `PENDING` | In progress | One execution; convergence needs no second one | No | No | Nothing | T37 |
+| 4.5 | Stays `PENDING` for a long time (many polls) | Not final yet | Re-observed on each call, never re-executed; the history keeps the first observation and the most recent ones (at most 20), so the record doesn't grow without limit | No | No | Call again later; escalate if it never settles | T182, T183 |
 
 ## 5. Conflict
 
@@ -68,6 +70,12 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 6.3 | Operation type not declared retryable | `INVESTIGATE` | No | T44 |
 | 6.4 | `UNKNOWN`, `PENDING`, `CONFLICTED`, `APPLIED` | Never `RETRY`, whatever the retry policy | No | T45, T102, T103, T104 |
 | 6.5 | Called again after the operation closed | Recorded result returned | No | T46, T100 |
+| 6.6 | Contract settings that would be unsafe or unfinishable (`maxInFlightMs` negative, NaN or infinite; `maxAttempts` not a positive integer; …) | `TypeError` before anything runs: no record, no `execute()` | No | T178, T179 |
+| 6.7 | `authorize()` returns something malformed (`{}`, `requiresReview: 0`, …) | `TypeError` before the operation is recorded; never treated as "no review needed" | No | T185 |
+| 6.8 | `reconcile()` throws, or returns something malformed, after `execute()` | `UNKNOWN` → `INVESTIGATE` (`RECONCILE_FAILED`), resolved and closed, instead of a `RESERVED` attempt every call throws on | No | T186 |
+| 6.9 | After `execute()`, a hook returns something the store can't copy: reason metadata with a cycle or BigInt, or an `observe()` result with a cycle, BigInt, function or Proxy, or one that isn't an observation (`null`, an unknown status, `observation_failed` without an error), or one whose getters answer differently later | The metadata is replaced by a note; the observation counts as failed (`UNKNOWN`), and what's stored is a snapshot read once; either way the attempt resolves instead of every call failing at the same write | No | T188, T189, T191, T192 |
+| 6.10 | With `PostgresStore`, hook output after `execute()` contains U+0000 or an unpaired surrogate (JSON allows them, `jsonb` doesn't) | Stored with U+FFFD in their place; the attempt resolves instead of every write being rejected. (An intent containing them is rejected at its first write, before anything runs.) | No | T193, T194 |
+| 6.11 | `observe()` itself returns `observation_failed` with an `error.raw` | `error.raw` is kept by reference, like a thrown error's (`InMemoryStore` keeps it; `PostgresStore` strips it); an `Error` used as the `error` keeps its message | No | T195, T196 |
 
 ## 7. Review
 
@@ -98,8 +106,13 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 7.23 | An operation approved by 0.3.x, which recorded no decision (or any approval on record without a reviewer), after upgrading | `AWAITING_REVIEW` with `APPROVAL_NOT_RECORDED` before any further attempt | Not until re-approved | T149, T150, T159 |
 | 7.24 | `reviewEffect()` records a decision | Records it and nothing else: no `execute()`, no `observe()`; the result says approved, not attempted since (also after earlier attempts); the next `runEffect()` attempts | Not by `reviewEffect()` | T151, T155 |
 | 7.25 | `runEffect()` is handed a decision object (e.g. by an agent's tool) | `TypeError`, nothing recorded: decisions only go through `reviewEffect()` | No | T152 |
-| 7.26 | `reviewEffect()` while another call holds the operation (or writes to it mid-review), or on one that isn't awaiting review | Busy: `OperationBusyError`, nothing recorded. Not awaiting review: current state returned, nothing recorded | No | T153, T154, T156, T157 |
+| 7.26 | `reviewEffect()` while another call holds the operation (or writes to it mid-review), or on one that isn't awaiting review | Busy: `OperationBusyError`, nothing recorded. Not awaiting review: `ReviewNotAcceptedError` (`NOT_AWAITING_REVIEW`) with the current state, nothing recorded | No | T153, T154, T156, T157 |
 | 7.27 | Approved (separately) after an attempt that got a not-applied response | The next `runEffect()` re-observes that attempt first (also if the review record lacks its attempt count); an effect that appeared during the wait is `COMPLETE` | No | T155, T158 |
+| 7.28 | A decision made on an earlier review's screen arrives after the operation went to review again | Refused (`ReviewNotAcceptedError`, `STALE_REVIEW_TOKEN`); a decision dated before the current review began is refused too (`DECIDED_BEFORE_REVIEW_OPENED`) | No | T160, T161 |
+| 7.29 | Each review of an operation | New token and generation each time (including after an expired approval); a token from another operation is refused; operations that awaited review before tokens existed get one on their next `runEffect()`; survives a restart | — | T162, T163, T164, T165, T166 |
+| 7.30 | The contract sets `maxApprovalAgeMs` | An approval stops covering attempts that much time after it was decided (or recorded, if earlier), with or without its own `expiresAt` (the earlier wins); already too old on arrival: refused; aged out before an attempt: `AWAITING_REVIEW` with `APPROVAL_EXPIRED` | Not until re-approved | T167, T168, T169, T170 |
+| 7.31 | Upgrading from 0.4.0: an approval it recorded (no token), or an operation a 0.4.0 worker sent back to review without a new review | The approval isn't honored (`APPROVAL_NOT_RECORDED`, new review); the already-answered token is refused and the next `runEffect()` opens a new review | No | T171, T172, T173, T174 |
+| 7.32 | Random sequences of all of the above: runs, decisions (current, stale, foreign, garbage tokens; dated before the review; expiring), `revalidate()` outcomes, transport outcomes, late landings, clock jumps, crashes, lock contention, 0.4.0 workers | At most one effect; nothing executes after close/rejection, without `revalidate()` saying proceed, or without an approval accepted since the last review and not yet expired; an approval after attempts re-observes first; exactly the decisions answering the open review are accepted | Only as above | T175, T176 |
 
 ## 8. Concurrency and lock loss
 
@@ -132,6 +145,9 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 9.11 | Request's explicit `identity.operationType` differs from the contract's (or pass the id as a plain string) | Throws before anything is written or executed; a string id always uses the contract's `operationType` | No | T114, T115 |
 | 9.9 | Contract supplies its own `fingerprintIntent()` | corrobo uses it and does not apply the default JSON rules to that intent; the store must still be able to persist the intent | No | T70, T111 |
 | 9.7 | A new identity | A genuinely new operation | Yes (it's new) | T75 |
+| 9.12 | Custom `fingerprintIntent()` that ignores a field `execute()` reads; a later request differs in it | Same operation; corrobo acts on the recorded (reviewed) intent, never the later request's | Only as recorded | T180 |
+| 9.13 | Custom `fingerprintIntent()`; the intent's `toJSON()` differs from the object, and a reviewer passes `fingerprintIntent(contract, intent)` of that object | The exported `fingerprintIntent()` uses the JSON form, as `runEffect()` does, so the approval matches | Once approved | T190 |
+| 9.14 | A hook (`authorize()`, `revalidate()`, `execute()`, `observe()`, `reconcile()`) changes the intent it receives; the caller changes its own object while `runEffect()` runs; or a later request only fingerprints equal to the recorded intent (`NaN` vs the recorded `null`) | Every hook receives its own copy of the recorded intent as stored: `execute()` sends what was recorded and approved, and later hooks see it unchanged; a `revalidate()` that edits the record it's given doesn't change corrobo's approval check | Only as recorded | T197, T198, T199 |
 
 ## 10. Persistence and privacy
 
@@ -155,9 +171,11 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 | # | Situation | Behavior | Proof |
 |---|---|---|---|
 | 11.1 | Provider idempotency key | Same key on every attempt of one operation; a new operation never reuses it | T92, T93 |
-| 11.2 | Idempotency replay window expired (e.g. Stripe's ~24h) | Replay refused: `UNKNOWN` → `INVESTIGATE`, never a new refund | T94 |
+| 11.2 | A lost response, or a re-check long after the attempt (past the key's retention, e.g. Stripe's ~24h) | The read-back finds the refund by the operation id the request carried in its metadata, so it never relies on the key's retention; the request is only re-sent by a retry, with the same key | T94, T184 |
 | 11.3 | Stable provider id known from `execute()` | Later checks look it up directly | T95 |
 | 11.4 | Lookup only by search/listing | **Assumes:** your contract returns `UNKNOWN` when absence can't be proven — see 3.4 | T30 |
+| 11.5 | An `observe()` that could create the effect (e.g. replaying the create request as its "read-back") | Not allowed: `observe()` runs where nothing may execute (crash recovery, re-checks, after an approval expired), so it must only read. The Stripe example reads only; an expired approval leads to review, not a refund | T181 |
+| 11.6 | Stripe example: an unlabeled refund of the same amount on the charge (made before refunds were labeled, or by hand) | Absence can't be proven: `UNKNOWN` (`UNLABELED_REFUND_PRESENT`), never a second refund | T187 |
 
 ## 12. What corrobo itself does on your machine
 
@@ -189,7 +207,7 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T11** [`tests/fencing.test.ts`](../tests/fencing.test.ts) — "after the window, a settled NOT_APPLIED retries in the same call"
 - **T12** [`tests/fencing-adversarial.test.ts`](../tests/fencing-adversarial.test.ts) — "returns cached RETRY before retryNotBefore without executing or observing"
 - **T13** [`tests/fencing-adversarial.test.ts`](../tests/fencing-adversarial.test.ts) — "retries immediately when transport ok:true proves the request is no longer in flight"
-- **T14** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "timeout BEFORE Stripe ever processes the request self-heals in one call via the idempotency replay"
+- **T14** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "timeout BEFORE Stripe ever processes the request: observe() only reads and finds nothing; the retry with the same key creates exactly one refund"
 - **T15** [`tests/disposition.test.ts`](../tests/disposition.test.ts) — "maxInFlightMs: 0 (re-execution provider-deduplicated) -> ordinary RETRY immediately"
 - **T16** [`tests/postgres-crash-recovery.test.ts`](../tests/postgres-crash-recovery.test.ts) — "a reserved attempt exists before execute() is ever called"
 - **T17** [`tests/runtime.test.ts`](../tests/runtime.test.ts) — "persists operation identity and intent before execute() runs, even if execute() throws"
@@ -269,8 +287,8 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T91** [`tests/fencing.test.ts`](../tests/fencing.test.ts) — "a 0.2.x RETRY whose request landed late: the settlement check finds APPLIED, no second effect"
 - **T92** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "reuses the same Stripe idempotency key across attempts of the same logical operation"
 - **T93** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "a NEW logical operation (new identity) never reuses an old idempotency key"
-- **T94** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "replay beyond the safe window is refused — UNKNOWN/INVESTIGATE, no second refund ever created"
-- **T95** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "once execute() itself returns a stable refund id, later re-observations use direct retrieve, never replay"
+- **T94** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "a lost response long after the attempt is still found by its metadata: no reliance on the idempotency key's retention"
+- **T95** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "once execute() itself returns a stable refund id, later re-observations retrieve it directly"
 - **T96** [`tests/failure-catalog.test.ts`](../tests/failure-catalog.test.ts) — "no logging of any kind in src/ (application payloads are never printed by corrobo)"
 - **T97** [`tests/failure-catalog.test.ts`](../tests/failure-catalog.test.ts) — "no network-capable code in src/ except PostgresStore's use of the pool you pass in"
 - **T98** [`tests/failure-catalog.test.ts`](../tests/failure-catalog.test.ts) — "the core and InMemoryStore make no network calls of their own"
@@ -329,9 +347,49 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T151** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "records the decision and does nothing else: no execute, no observe; runEffect() then makes the attempt"
 - **T152** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "runEffect() refuses a decision object: decisions go through reviewEffect()"
 - **T153** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "while another call holds the operation it throws OperationBusyError and records nothing"
-- **T154** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an operation that isn't awaiting review is returned unchanged, and the decision isn't recorded"
+- **T154** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a decision on an operation that isn't awaiting review is refused loudly (ReviewNotAcceptedError), and nothing is recorded"
 - **T155** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "approved after an attempt that got a not-applied response: the next runEffect() re-observes first, so an effect that appeared meanwhile isn't repeated"
 - **T156** [`tests/postgres-review.test.ts`](../tests/postgres-review.test.ts) — "reviewEffect() throws OperationBusyError while another process holds the operation's advisory lock"
 - **T157** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a concurrent write while the decision is being recorded is OperationBusyError, and the decision isn't recorded"
 - **T158** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review record without attemptCount is treated as recent: the next runEffect() re-observes first"
+- **T160** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a decision made on an earlier review's screen can't approve a later review of the same operation (stale token)"
+- **T161** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a decision dated before the current review began is refused even with the current token"
+- **T162** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "each review gets a new token (and generation), only while AWAITING_REVIEW, distinct across operations"
+- **T163** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an expired approval opens a new review: the old token no longer answers it"
+- **T164** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an operation that went to review before tokens existed gets one on its next runEffect()"
+- **T165** [`tests/postgres-review.test.ts`](../tests/postgres-review.test.ts) — "review tokens persist: minted at creation, read back by another process, and a stale one is refused there"
+- **T166** [`tests/postgres-review.test.ts`](../tests/postgres-review.test.ts) — "migrate() adds review_episode to an older table; a row awaiting review there gets a token on its next run"
+- **T171** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval recorded without a token (corrobo 0.4.0) isn't honored after upgrading: a new review opens"
+- **T172** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review already answered can't be answered again, even if the operation is put back to review without a new one"
+- **T173** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review a 0.4.0 worker answered (no token) and then reopened can't be answered with its old token"
+- **T167** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval without expiresAt stops covering attempts once it is older than maxApprovalAgeMs"
+- **T168** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "the earlier of expiresAt and maxApprovalAgeMs wins, and age counts from decidedAt when that is earlier"
+- **T169** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval already older than maxApprovalAgeMs when it arrives is refused"
+- **T170** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "within maxApprovalAgeMs the approval works as usual; an invalid maxApprovalAgeMs fails closed"
+- **T174** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "a review opened in the same millisecond a 0.4.0 approval was recorded still has a usable token (found by the model test)"
+- **T175** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 400 random seeds of 60 steps (CORROBO_MODEL_SEEDS for more)"
+- **T177** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "a deploy that shortens maxInFlightMs doesn't let an attempt sent under the longer window be retried early"
+- **T178** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "%s is refused before anything runs"
+- **T179** [`tests/contract-validation.test.ts`](../tests/contract-validation.test.ts) — "is persisted on the attempt and read back by another process"
+- **T180** [`tests/recorded-intent.test.ts`](../tests/recorded-intent.test.ts) — "with a custom fingerprint, a later request can't change what the reviewer approved"
+- **T181** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "observe() never creates a refund: an approval that expired while the request was lost leads to review, not a refund"
+- **T182** [`tests/observation-history.test.ts`](../tests/observation-history.test.ts) — "a long PENDING keeps the first observation and the most recent ones, at most 20"
+- **T183** [`tests/observation-history.test.ts`](../tests/observation-history.test.ts) — "is bounded and persisted, and read back by another process"
+- **T184** [`tests/stripe-refund.test.ts`](../tests/stripe-refund.test.ts) — "the read-back pages through a charge's refunds: ours behind 150 others is still found"
+- **T185** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s throws before anything is recorded or executed (a malformed answer never skips review)"
+- **T186** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "reconcile() that %s after execute() records UNKNOWN / INVESTIGATE and closes, instead of throwing forever"
+- **T187** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "an unlabeled refund of the same amount (made before refunds were labeled) means absence can't be proven: UNKNOWN, no second refund"
+- **T188** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: reconcile() reason metadata with %s is recorded as a note; the attempt resolves"
+- **T189** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() data with %s counts as a failed observation (UNKNOWN), not a write that fails forever"
+- **T190** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "an approval carrying fingerprintIntent(contract, intent) of the request's own object is accepted, even when its toJSON() differs"
+- **T191** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() returning %s counts as a failed observation (UNKNOWN), not a write that fails forever"
+- **T192** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: an observation whose status getter answers differently later is stored as first read; the attempt resolves"
+- **T193** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "PostgresStore: hook output containing %s is stored with U+FFFD in its place; the attempt resolves"
+- **T194** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "PostgresStore: observe() throwing an error whose message contains U+0000 still resolves the attempt"
+- **T195** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "InMemoryStore: an error.raw that observe() returns itself is kept by reference, not copied"
+- **T196** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() returning observation_failed with an Error as its error keeps the error's message"
+- **T197** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "revalidate() mutating its intent doesn't change the approved amount execute() sends"
+- **T198** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "authorize() mutating its intent doesn't change the first attempt"
+- **T199** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "a later request that only fingerprints equal (NaN vs the recorded null) can't change what execute() sends"
+- **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"

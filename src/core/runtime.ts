@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from "node:crypto";
 import { decideDisposition } from "./disposition";
 import type { DecideDispositionResult } from "./disposition";
 import { canonicalStringify, fingerprintIntent, materializeIntent } from "./fingerprint";
@@ -18,7 +19,9 @@ import type {
   ReasonCode,
   RecordedReview,
   ReviewDecision,
+  ReviewEpisode,
   ReviewRequest,
+  TokenlessReview,
   ReservedAttempt,
   ResolvedAttempt,
   TransportOutcome
@@ -79,7 +82,8 @@ function resultForInProgress<Observation>(identity: OperationRecord["identity"])
     observation: null,
     attempts: [],
     retryNotBefore: null,
-    review: null
+    review: null,
+    reviewToken: null
   };
 }
 
@@ -92,8 +96,8 @@ function resultForInProgress<Observation>(identity: OperationRecord["identity"])
  * The request's intent as it will be stored, read once per runEffect() call. With the default
  * fingerprint, `stored` is the plain-JSON form (see materializeIntent) and `fingerprint` is
  * computed from it, so what is fingerprinted is exactly what is persisted. With a contract's own
- * fingerprintIntent(), the intent is stored as given and fingerprinted lazily, only when there
- * is an existing record to compare against.
+ * fingerprintIntent(), `stored` is the intent's JSON form, which every hook then acts on (see
+ * runEffect), and it is fingerprinted lazily, only when there is an existing record to compare.
  */
 interface PreparedIntent {
   stored: unknown;
@@ -102,7 +106,16 @@ interface PreparedIntent {
 
 function prepareIntent<Intent>(contract: EffectContract<Intent, unknown, unknown>, intent: Intent): PreparedIntent {
   if (contract.fingerprintIntent) {
-    return { stored: intent, fingerprint: null };
+    // Stored, and acted on in every call (the first one too), as its JSON form, so authorize(),
+    // execute() and later calls all see exactly what was recorded, in either store.
+    let json: string | undefined;
+    try {
+      json = JSON.stringify(intent);
+    } catch (err) {
+      throw new TypeError(`corrobo: the intent can't be stored as JSON (${errorMessage(err)}); nothing was run.`);
+    }
+    if (json === undefined) throw new TypeError("corrobo: the intent can't be stored as JSON (it is undefined); nothing was run.");
+    return { stored: JSON.parse(json), fingerprint: null };
   }
   const stored = materializeIntent(intent);
   return { stored, fingerprint: canonicalStringify(stored) };
@@ -113,7 +126,53 @@ type ValidDecision = ReviewDecision;
 /** An EffectRequest after identity shorthand is resolved (see runEffect). */
 type ResolvedRequest<Intent, Context = unknown> = Omit<EffectRequest<Intent, Context>, "identity"> & {
   identity: OperationIdentity;
+  /** A fresh copy of the intent this pass acts on, for each hook (see intentCopier). */
+  intentOf?: () => Intent;
 };
+
+/**
+ * Each hook gets its own copy of the recorded intent, as stored (its JSON form): the intent that
+ * was authorized, reviewed and fingerprinted, never the caller's object. So no hook, and no later
+ * change to the caller's object, can alter what another hook (execute() included) receives, and
+ * an approval for one intent can't be spent on another. Two objects that fingerprint the same
+ * but differ (NaN and null, a Date and its ISO string) can't diverge here either: hooks only ever
+ * see the stored form.
+ */
+function intentCopier<Intent>(recorded: unknown): () => Intent {
+  const json = JSON.stringify(recorded);
+  return () => JSON.parse(json) as Intent;
+}
+
+/**
+ * The record revalidate() is handed: its own copy, so editing it can't change the checks corrobo
+ * makes after the hook. Raw thrown errors (kept only by InMemoryStore) are left out; PostgresStore
+ * never stores them either.
+ */
+function recordForHook(record: OperationRecord): OperationRecord {
+  const withoutRaw = (error: { message: string; raw?: unknown }) => ({ message: error.message });
+  const attempts = record.attempts.map((attempt) =>
+    attempt.status !== "RESOLVED"
+      ? attempt
+      : {
+          ...attempt,
+          transport: attempt.transport.ok ? attempt.transport : { ok: false as const, error: withoutRaw(attempt.transport.error) },
+          observations: attempt.observations.map((o) =>
+            o.status === "observation_failed" ? { ...o, error: withoutRaw(o.error) } : o
+          )
+        }
+  );
+  const stripped = { ...record, attempts };
+  try {
+    return structuredClone(stripped);
+  } catch {
+    return JSON.parse(JSON.stringify(stripped)) as OperationRecord;
+  }
+}
+
+/** The intent a hook receives: its own copy (see intentCopier). */
+function freshIntent<Intent>(request: ResolvedRequest<Intent, any>): Intent {
+  return request.intentOf ? request.intentOf() : request.intent;
+}
 
 /**
  * Thrown by reviewEffect() when another call holds this operation right now (it is being
@@ -126,6 +185,92 @@ export class OperationBusyError extends Error {
     this.name = "OperationBusyError";
     this.identityId = identityId;
   }
+}
+
+/** Why reviewEffect() refused a well-formed decision (see ReviewNotAcceptedError). */
+export type ReviewRefusal =
+  | "NOT_AWAITING_REVIEW"
+  | "STALE_REVIEW_TOKEN"
+  | "DECIDED_BEFORE_REVIEW_OPENED"
+  | "INTENT_MISMATCH"
+  | "APPROVAL_ALREADY_EXPIRED";
+
+/**
+ * Thrown by reviewEffect() when it refuses a decision: the operation isn't awaiting review, the
+ * decision answers a different review (stale token, or dated before this review began), it was
+ * made for a different intent, or the approval has already expired. Nothing was recorded.
+ * `current` is the operation's state now, for showing the reviewer what actually happened.
+ */
+export class ReviewNotAcceptedError extends Error {
+  readonly identityId: string;
+  readonly code: ReviewRefusal;
+  readonly current: EffectResult<unknown>;
+  constructor(identityId: string, code: ReviewRefusal, message: string, current: EffectResult<unknown>) {
+    super(`corrobo: the review decision for operation "${identityId}" was not recorded (${code}): ${message}`);
+    this.name = "ReviewNotAcceptedError";
+    this.identityId = identityId;
+    this.code = code;
+    this.current = current;
+  }
+}
+
+/**
+ * The review a decision can answer right now: the operation awaits review and its episode hasn't
+ * been answered yet. An episode a recorded decision already answered is used up (e.g. a 0.4.0
+ * worker sent the operation back to review without opening a new one); its token never counts
+ * again, and runEffect() opens a new review instead.
+ */
+function openReview(record: OperationRecord): ReviewEpisode | null {
+  const episode = record.reviewEpisode;
+  if (record.status !== "AWAITING_REVIEW" || !episode) return null;
+  const review = record.review;
+  // Answered: a decision carries this episode's token; or a decision without a token is on
+  // record. Only corrobo 0.4.0 records those, and corrobo moves any that is on record when it
+  // opens a review out of the way (ReviewEpisode.supersededDecision), so one that's here now was
+  // written after this review opened. (A record from 0.5.0, which didn't move them, at worst
+  // gets one extra new review; a used-up token never counts.)
+  const answered =
+    review !== undefined && (typeof review.reviewToken === "string" ? review.reviewToken === episode.token : true);
+  return answered ? null : episode;
+}
+
+/** The token a decision must carry right now (see openReview), or null. */
+function currentReviewToken(record: OperationRecord): string | null {
+  return openReview(record)?.token ?? null;
+}
+
+/**
+ * Begins a new review of this operation. The token is a digest of the operation, this review's
+ * generation and start time, the recorded intent's fingerprint and a random nonce, so no two
+ * reviews ever share one (even if a store lost the previous episode). It isn't a secret (it
+ * doesn't authenticate anyone); it's a binding, so a decision made for one review can't answer
+ * another.
+ */
+async function openReviewEpisode(
+  store: CoordinatedStore,
+  identity: OperationIdentity,
+  intentFingerprint: string,
+  previous: ReviewEpisode | undefined,
+  decisionOnRecord?: RecordedReview
+): Promise<ReviewEpisode> {
+  const generation = (previous?.generation ?? 0) + 1;
+  const openedAt = await safetyNow(store);
+  const token = createHash("sha256")
+    .update(
+      JSON.stringify([identity.operationType, identity.id, generation, openedAt, intentFingerprint, randomBytes(16).toString("hex")])
+    )
+    .digest("hex")
+    .slice(0, 32);
+  const episode: ReviewEpisode = { token, generation, openedAt };
+  if (decisionOnRecord && typeof decisionOnRecord.reviewToken !== "string") {
+    episode.supersededDecision = decisionOnRecord as unknown as TokenlessReview;
+  }
+  return episode;
+}
+
+/** Writing a new review: a tokenless decision it supersedes moves into it (see openReview). */
+function reviewEpisodeUpdate(reviewEpisode: ReviewEpisode): { reviewEpisode: ReviewEpisode; review?: null } {
+  return reviewEpisode.supersededDecision ? { reviewEpisode, review: null } : { reviewEpisode };
 }
 
 const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(Z|[+-](\d{2}):(\d{2}))$/i;
@@ -176,8 +321,11 @@ function parseReviewDecision(input: unknown): ValidDecision {
   };
   if (typeof input !== "object" || input === null) fail(`must be a ReviewDecision object`);
   // Each field is read exactly once, so what is validated is what is recorded.
-  const { decision, reviewer, decidedAt, expiresAt, intentFingerprint, note } = input as ReviewDecision;
+  const { decision, reviewToken, reviewer, decidedAt, expiresAt, intentFingerprint, note } = input as ReviewDecision;
   if (decision !== "approved" && decision !== "rejected") fail(`.decision must be "approved" or "rejected"`);
+  if (typeof reviewToken !== "string" || reviewToken === "") {
+    fail(`.reviewToken must be the reviewToken from the result that reported AWAITING_REVIEW`);
+  }
   if (typeof reviewer !== "string" || reviewer.trim() === "") fail(`.reviewer must be a non-empty string`);
   const timeFormat = `an RFC 3339 timestamp with Z or an offset, e.g. "2026-10-01T12:00:00Z"`;
   const decided = decidedAt === undefined ? undefined : (canonicalTime(decidedAt) ?? fail(`.decidedAt must be ${timeFormat}`));
@@ -191,7 +339,7 @@ function parseReviewDecision(input: unknown): ValidDecision {
   }
   if (intentFingerprint !== undefined && typeof intentFingerprint !== "string") fail(`.intentFingerprint must be a string`);
   if (note !== undefined && typeof note !== "string") fail(`.note must be a string`);
-  const review: ValidDecision = { decision, reviewer };
+  const review: ValidDecision = { decision, reviewToken, reviewer };
   if (decided !== undefined) review.decidedAt = decided;
   if (expires !== undefined) review.expiresAt = expires;
   if (intentFingerprint !== undefined) review.intentFingerprint = intentFingerprint;
@@ -246,6 +394,89 @@ function assertSameLogicalOperation<Intent>(
   }
 }
 
+/**
+ * authorize()'s answer, checked: anything but `{ requiresReview: boolean, reason?: ReasonCode }`
+ * throws before the operation is recorded, so a malformed answer can never skip review.
+ */
+function validAuthorization(result: unknown): { requiresReview: boolean; reason?: ReasonCode } {
+  let requiresReview: unknown;
+  let reason: unknown;
+  let storedReason: ReasonCode | undefined;
+  try {
+    if (typeof result === "object" && result !== null) ({ requiresReview, reason } = result as Record<string, unknown>);
+    if (reason !== undefined) storedReason = storableReason(reason);
+  } catch (err) {
+    throw new TypeError(`corrobo: authorize() returned a result that can't be read (${errorMessage(err)}); nothing was recorded or executed.`);
+  }
+  if (typeof requiresReview !== "boolean") {
+    throw new TypeError(
+      "corrobo: authorize() must return { requiresReview: true | false }; it returned something else, so nothing was recorded or executed."
+    );
+  }
+  if (reason !== undefined && !storedReason) {
+    throw new TypeError("corrobo: authorize() returned a reason without a string code and summary; nothing was recorded or executed.");
+  }
+  return storedReason === undefined ? { requiresReview } : { requiresReview, reason: storedReason };
+}
+
+const INVALID_REASON = Symbol("invalid reason");
+
+const EVIDENCE_STATES: readonly EvidenceState[] = ["APPLIED", "NOT_APPLIED", "CONFLICTED", "PENDING", "UNKNOWN"];
+
+/**
+ * reconcile() is caught here: it runs after execute(), so a throw (or an answer that isn't one)
+ * must not leave the attempt RESERVED forever, with every later call throwing at the same place.
+ * It becomes UNKNOWN (so INVESTIGATE), honestly: corrobo can't tell what happened.
+ */
+function safeReconcile(
+  contract: EffectContract<any, any, any, any>,
+  input: { intent: unknown; transport: TransportOutcome<unknown>; observation: ObservationResult<unknown> }
+): { evidenceState: EvidenceState; reason: ReasonCode; observedEffect?: unknown } {
+  try {
+    const result: unknown = contract.reconcile(input);
+    const { evidenceState, reason, observedEffect } = (result ?? {}) as Record<string, unknown>;
+    const storedReason = storableReason(reason);
+    if (!EVIDENCE_STATES.includes(evidenceState as EvidenceState) || !storedReason) {
+      return reconcileFailed("reconcile() returned no valid evidence state and reason.");
+    }
+    return {
+      evidenceState: evidenceState as EvidenceState,
+      reason: storedReason,
+      ...(observedEffect !== undefined ? { observedEffect } : {})
+    };
+  } catch (err) {
+    return reconcileFailed(`reconcile() threw: ${errorMessage(err)}.`);
+  }
+}
+
+function reconcileFailed(summary: string): { evidenceState: EvidenceState; reason: ReasonCode } {
+  return {
+    evidenceState: "UNKNOWN",
+    reason: { code: "RECONCILE_FAILED", summary: `${summary} What happened can't be established from it; investigate.` }
+  };
+}
+
+/**
+ * A hook's reason, read once and stored as plain data: a getter or Proxy can't answer differently
+ * later, and metadata JSON can't store (a cycle, a BigInt) is replaced by a note instead of making
+ * the write fail. Undefined if it isn't a reason (no string code and summary).
+ */
+function storableReason(value: unknown): ReasonCode | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const { code, summary, metadata } = value as Record<string, unknown>;
+  if (typeof code !== "string" || typeof summary !== "string") return undefined;
+  if (metadata === undefined) return { code, summary };
+  const stored = jsonCopy(metadata);
+  return {
+    code,
+    summary,
+    metadata:
+      typeof stored === "object" && stored !== null && !Array.isArray(stored)
+        ? (stored as Record<string, unknown>)
+        : { unstorable: "this reason's metadata can't be stored as a JSON object, so it was left out" }
+  };
+}
+
 /** execute() is caught here — a throw or timeout becomes transport evidence, never an uncaught rejection. */
 async function safeExecute<Intent, Evidence>(
   contract: EffectContract<Intent, unknown, Evidence>,
@@ -261,23 +492,71 @@ async function safeExecute<Intent, Evidence>(
   }
 }
 
-/** observe() is caught here — a throw becomes observation_failed, never UNKNOWN by accident being skipped. */
+function isObservation(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const { status, error } = value as { status?: unknown; error?: unknown };
+  if (status === "observed" || status === "pending") return true;
+  return (
+    status === "observation_failed" &&
+    typeof error === "object" &&
+    error !== null &&
+    typeof (error as { message?: unknown }).message === "string"
+  );
+}
+
+/** A copy of observe()'s result read once, with any error.raw set aside (see safeObserve). */
+function snapshotObservation(observation: unknown): { stored: unknown; raw: { present: boolean; value?: unknown } } {
+  if (typeof observation !== "object" || observation === null) return { stored: observation, raw: { present: false } };
+  const top: Record<string, unknown> = { ...(observation as Record<string, unknown>) };
+  let raw: { present: boolean; value?: unknown } = { present: false };
+  if (typeof top.error === "object" && top.error !== null) {
+    // An Error's message isn't enumerable, so a spread alone would lose it.
+    const error: Record<string, unknown> = { ...(top.error as Record<string, unknown>), message: (top.error as { message?: unknown }).message };
+    if ("raw" in error) {
+      raw = { present: true, value: error.raw };
+      delete error.raw;
+    }
+    top.error = error;
+  }
+  return { stored: structuredClone(top), raw };
+}
+
+/**
+ * observe() is caught here — a throw becomes observation_failed, never UNKNOWN by accident being
+ * skipped. reconcile() gets what observe() returned; the attempt stores `stored`, a snapshot taken
+ * once and checked, so a getter can't answer differently at the write.
+ */
 async function safeObserve<Intent, Observation, Evidence>(
   contract: EffectContract<Intent, Observation, Evidence>,
   intent: Intent,
   identity: OperationRecord["identity"],
   transport: TransportOutcome<Evidence>,
   attemptStartedAt: string
-): Promise<ObservationResult<Observation>> {
+): Promise<{ observation: ObservationResult<Observation>; stored: ObservationResult<unknown> }> {
   try {
-    return await contract.observe({ intent, identity, transport, attemptStartedAt });
+    const observation = await contract.observe({ intent, identity, transport, attemptStartedAt });
+    // If it isn't an observation, or a store can't copy it (JSON for Postgres, structured clone in
+    // memory), every pass would fail at that write and leave the attempt RESERVED, so it counts as
+    // a failed observation (UNKNOWN) instead.
+    // An error.raw it returns is the caller's own error, kept by reference like a thrown one
+    // (InMemoryStore keeps it, PostgresStore strips it), so it's set aside rather than copied.
+    const { stored, raw } = snapshotObservation(observation);
+    if (!isObservation(stored)) {
+      throw new Error(
+        'observe() returned no valid observation (status "observed", "pending" or "observation_failed" with an error message)'
+      );
+    }
+    JSON.stringify(stored);
+    if (raw.present) (stored as { error: { raw?: unknown } }).error.raw = raw.value;
+    return { observation, stored: stored as ObservationResult<unknown> };
   } catch (err) {
-    return {
+    const failed: ObservationResult<Observation> = {
       status: "observation_failed",
       error: { message: errorMessage(err), raw: err },
       source: contract.operationType,
       observedAt: nowIso()
     };
+    return { observation: failed, stored: failed as ObservationResult<unknown> };
   }
 }
 
@@ -305,7 +584,8 @@ function resultBeforeAttempt<Observation>(
     observation: observation as ObservationResult<Observation> | null,
     attempts: record.attempts,
     retryNotBefore: null,
-    review: record.review ?? null
+    review: record.review ?? null,
+    reviewToken: currentReviewToken(record)
   };
 }
 
@@ -384,7 +664,8 @@ function resultFromRecord<Observation>(record: OperationRecord): EffectResult<Ob
       observation: null,
       attempts: record.attempts,
       retryNotBefore: null,
-      review: record.review ?? null
+      review: record.review ?? null,
+      reviewToken: currentReviewToken(record)
     };
   }
 
@@ -399,7 +680,8 @@ function resultFromRecord<Observation>(record: OperationRecord): EffectResult<Ob
     observation: latestObservation as ObservationResult<Observation> | null,
     attempts: record.attempts,
     retryNotBefore: latest.retryNotBefore ?? null,
-    review: record.review ?? null
+    review: record.review ?? null,
+    reviewToken: currentReviewToken(record)
   };
 }
 
@@ -409,7 +691,8 @@ function decide(
   attemptNumber: number,
   transport: TransportOutcome<unknown>,
   attemptStartedAt: string,
-  now: string
+  now: string,
+  windowWhenStarted: number | undefined
 ): DecideDispositionResult {
   return decideDisposition({
     evidenceState,
@@ -419,9 +702,51 @@ function decide(
       transportOk: transport.ok,
       attemptStartedAt,
       now,
-      maxInFlightMs: contract.maxInFlightMs
+      maxInFlightMs: settlementWindow(contract.maxInFlightMs, windowWhenStarted)
     }
   });
+}
+
+/**
+ * The in-flight window to settle an attempt with: the contract's current one, never shorter than
+ * the one the attempt was sent under (a deploy that shortens it must not let an earlier request,
+ * still in flight, be retried early). No current window means none: INVESTIGATE, as declared.
+ */
+function settlementWindow(current: number | undefined, whenStarted: number | undefined): number | undefined {
+  if (current === undefined) return undefined;
+  return whenStarted === undefined ? current : Math.max(current, whenStarted);
+}
+
+/**
+ * Rejects a contract whose settings would make corrobo unsafe or unable to finish, before
+ * anything runs: a negative or non-finite maxInFlightMs (an immediate retry while a request may
+ * still land, or a throw after the effect), a maxAttempts that isn't a positive integer, and so on.
+ */
+function validateContract(contract: EffectContract<any, any, any, any>): void {
+  const fail = (problem: string): never => {
+    throw new TypeError(`corrobo: contract "${String(contract?.operationType)}" ${problem}; nothing was run.`);
+  };
+  if (typeof contract !== "object" || contract === null) fail("is not an object");
+  if (typeof contract.operationType !== "string" || contract.operationType === "") fail("needs a non-empty operationType");
+  for (const hook of ["execute", "observe", "reconcile"] as const) {
+    if (typeof contract[hook] !== "function") fail(`needs ${hook}()`);
+  }
+  for (const hook of ["authorize", "revalidate", "fingerprintIntent"] as const) {
+    if (contract[hook] !== undefined && typeof contract[hook] !== "function") fail(`has a ${hook} that isn't a function`);
+  }
+  const policy = contract.retryPolicy;
+  if (typeof policy !== "object" || policy === null) fail("needs a retryPolicy");
+  const maxAttempts = policy.maxAttempts;
+  if (!(maxAttempts === Number.POSITIVE_INFINITY || (Number.isSafeInteger(maxAttempts) && maxAttempts >= 1))) {
+    fail("needs retryPolicy.maxAttempts to be an integer >= 1 (or Infinity)");
+  }
+  if (typeof policy.retryOnNotApplied !== "boolean") fail("needs retryPolicy.retryOnNotApplied to be true or false");
+  for (const field of ["maxInFlightMs", "maxApprovalAgeMs"] as const) {
+    const value = contract[field];
+    if (value !== undefined && !(typeof value === "number" && Number.isFinite(value) && value >= 0)) {
+      fail(`has an invalid ${field} (${String(value)}); it must be a finite number >= 0, or omitted`);
+    }
+  }
 }
 
 /** OPEN while something further is expected (a retry, or convergence); CLOSED otherwise. */
@@ -436,13 +761,21 @@ function statusAfter(evidenceState: EvidenceState, disposition: ResolvedAttempt[
  */
 function resolveAttempt(
   contract: EffectContract<unknown, unknown, unknown>,
-  base: { attemptNumber: number; startedAt: string; check?: PreExecuteCheck },
+  base: { attemptNumber: number; startedAt: string; check?: PreExecuteCheck; maxInFlightMs?: number },
   transport: TransportOutcome<unknown>,
   observations: ObservationResult<unknown>[],
-  reconciliation: { evidenceState: EvidenceState; reason: ReasonCode },
+  reconciliation: { evidenceState: EvidenceState; reason: ReasonCode; observedEffect?: unknown },
   now: string
 ): ResolvedAttempt {
-  const decision = decide(contract, reconciliation.evidenceState, base.attemptNumber, transport, base.startedAt, now);
+  const decision = decide(
+    contract,
+    reconciliation.evidenceState,
+    base.attemptNumber,
+    transport,
+    base.startedAt,
+    now,
+    base.maxInFlightMs
+  );
   const attempt: ResolvedAttempt = {
     status: "RESOLVED",
     attemptNumber: base.attemptNumber,
@@ -461,7 +794,33 @@ function resolveAttempt(
   if (base.check) {
     attempt.check = base.check;
   }
+  if (base.maxInFlightMs !== undefined) {
+    attempt.maxInFlightMs = base.maxInFlightMs;
+  }
+  const observedEffect = jsonCopy(reconciliation.observedEffect);
+  if (observedEffect !== undefined) {
+    attempt.observedEffect = observedEffect;
+  }
   return attempt;
+}
+
+const MAX_OBSERVATIONS = 20;
+
+/** The first observation and the most recent ones, at most MAX_OBSERVATIONS in all. */
+function boundedObservations(observations: ObservationResult<unknown>[]): ObservationResult<unknown>[] {
+  if (observations.length <= MAX_OBSERVATIONS) return observations;
+  return [observations[0], ...observations.slice(observations.length - (MAX_OBSERVATIONS - 1))];
+}
+
+/** A plain-JSON copy of a value, or undefined if it isn't one (or JSON can't represent it). Never throws. */
+function jsonCopy(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  try {
+    const json = JSON.stringify(value);
+    return json === undefined ? undefined : JSON.parse(json);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -478,7 +837,7 @@ async function performAttempt<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   base: AttemptBase,
-  intent: Intent,
+  intentOf: () => Intent,
   check?: PreExecuteCheck
 ): Promise<EffectResult<Observation>> {
   const { identity, attemptNumber } = base;
@@ -486,21 +845,23 @@ async function performAttempt<Intent, Observation, Evidence>(
   // expiry is judged at the attempt's start time, not some earlier moment).
   const startedAt = check ? check.checkedAt : await safetyNow(store);
 
-  const reservedRecord = await store.reserveAttempt(
-    identity.id,
-    check ? { attemptNumber, startedAt, check } : { attemptNumber, startedAt },
-    base.version
-  );
+  const reserved = {
+    attemptNumber,
+    startedAt,
+    ...(check ? { check } : {}),
+    ...(contract.maxInFlightMs !== undefined ? { maxInFlightMs: contract.maxInFlightMs } : {})
+  };
+  const reservedRecord = await store.reserveAttempt(identity.id, reserved, base.version);
 
-  const transport = await safeExecute(contract, intent, identity, attemptNumber);
-  const observation = await safeObserve(contract, intent, identity, transport, startedAt);
-  const reconciliation = contract.reconcile({ intent, transport, observation });
+  const transport = await safeExecute(contract, intentOf(), identity, attemptNumber);
+  const { observation, stored } = await safeObserve(contract, intentOf(), identity, transport, startedAt);
+  const reconciliation = safeReconcile(contract, { intent: intentOf(), transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
-    check ? { attemptNumber, startedAt, check } : { attemptNumber, startedAt },
+    reserved,
     transport as TransportOutcome<unknown>,
-    [observation as ObservationResult<unknown>],
+    [stored],
     reconciliation,
     await safetyNow(store)
   );
@@ -536,14 +897,42 @@ function checkApproval(
       summary: "The recorded approval was given for a different intent than the one recorded for this operation. It needs a new review."
     };
   }
-  if (approval.expiresAt !== undefined && Date.parse(now) >= Date.parse(approval.expiresAt)) {
+  const expiry = approvalExpiry(contract, approval);
+  if (expiry && Date.parse(now) >= Date.parse(expiry.at)) {
     return {
       code: "APPROVAL_EXPIRED",
-      summary: `The approval expired at ${approval.expiresAt}, before this attempt. Nothing was executed; it needs a new review.`,
-      metadata: { expiresAt: approval.expiresAt }
+      summary:
+        `The approval expired at ${expiry.at} (${expiry.because}), before this attempt. ` +
+        "Nothing was executed; it needs a new review.",
+      metadata: { expiresAt: expiry.at, because: expiry.because }
     };
   }
   return null;
+}
+
+/**
+ * When an approval stops covering new attempts: its own expiresAt, or the contract's
+ * maxApprovalAgeMs after it was decided (or recorded, if earlier), whichever comes first.
+ */
+function approvalExpiry(
+  contract: EffectContract<any, unknown, unknown, any>,
+  approval: Pick<RecordedReview, "expiresAt" | "decidedAt" | "recordedAt">
+): { at: string; because: string } | null {
+  const maxAge = contract.maxApprovalAgeMs;
+  if (maxAge !== undefined && !(typeof maxAge === "number" && Number.isFinite(maxAge) && maxAge >= 0)) {
+    throw new TypeError(`corrobo: contract "${contract.operationType}" has an invalid maxApprovalAgeMs; it must be a finite number >= 0.`);
+  }
+  const candidates: { at: number; because: string }[] = [];
+  if (approval.expiresAt !== undefined) {
+    candidates.push({ at: Date.parse(approval.expiresAt), because: "its expiresAt" });
+  }
+  if (maxAge !== undefined) {
+    const decided = Math.min(Date.parse(approval.decidedAt), Date.parse(approval.recordedAt));
+    candidates.push({ at: decided + maxAge, because: `the contract's maxApprovalAgeMs of ${maxAge}` });
+  }
+  if (candidates.length === 0) return null;
+  const first = candidates.reduce((a, b) => (b.at < a.at ? b : a));
+  return { at: new Date(first.at).toISOString(), because: first.because };
 }
 
 const APPROVAL_NOT_RECORDED: ReasonCode = {
@@ -576,14 +965,6 @@ const REVALIDATION_DEFAULT_REASONS: Record<RevalidationOutcome, ReasonCode> = {
 
 type RevalidationOutcome = "proceed" | "requiresReview" | "reject";
 
-function isReasonCode(value: unknown): value is ReasonCode {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as ReasonCode).code === "string" &&
-    typeof (value as ReasonCode).summary === "string"
-  );
-}
 
 function revalidationFailed(summary: string): Pick<PreExecuteCheck, "outcome" | "reason"> {
   return {
@@ -607,20 +988,18 @@ async function runRevalidate<Intent, Context>(
   let reason: unknown;
   try {
     const result: unknown = await contract.revalidate!({
-      intent: request.intent,
+      intent: freshIntent(request),
       identity: { ...record.identity },
       attemptNumber,
       approval: approval ? { ...approval } : null,
-      record,
+      // Its own copy: corrobo checks the approval against this record again after the hook.
+      record: recordForHook(record),
       context: request.context
     });
     // Read each field once, inside the try: a throwing getter fails closed like a throw.
     if (typeof result === "object" && result !== null) {
       ({ decision, reason } = result as { decision?: unknown; reason?: unknown });
-      if (typeof reason === "object" && reason !== null) {
-        const { code, summary, metadata } = reason as ReasonCode;
-        reason = metadata === undefined ? { code, summary } : { code, summary, metadata };
-      }
+      if (reason !== undefined) reason = storableReason(reason) ?? INVALID_REASON;
     }
   } catch (err) {
     return revalidationFailed(`revalidate() threw: ${errorMessage(err)}.`);
@@ -628,10 +1007,10 @@ async function runRevalidate<Intent, Context>(
   if (decision !== "proceed" && decision !== "requiresReview" && decision !== "reject") {
     return revalidationFailed(`revalidate() returned no valid decision (expected "proceed", "requiresReview" or "reject").`);
   }
-  if (reason !== undefined && !isReasonCode(reason)) {
+  if (reason === INVALID_REASON) {
     return revalidationFailed(`revalidate() returned a reason without a string code and summary.`);
   }
-  return { outcome: decision, reason: reason ?? REVALIDATION_DEFAULT_REASONS[decision] };
+  return { outcome: decision, reason: (reason as ReasonCode | undefined) ?? REVALIDATION_DEFAULT_REASONS[decision] };
 }
 
 /**
@@ -652,18 +1031,22 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
     version: record.version,
     attemptNumber: record.attempts.length + 1
   };
-  // An approval counts only with a recorded reviewer.
+  // An approval counts only with a recorded reviewer, given for the operation's current review
+  // (its token is that review's). One without (recorded by corrobo 0.4.0, which kept no tokens,
+  // or by a store that dropped them) fails closed below.
   const attributed =
     record.review?.decision === "approved" &&
     typeof record.review.reviewer === "string" &&
-    record.review.reviewer.trim() !== "";
+    record.review.reviewer.trim() !== "" &&
+    typeof record.review.reviewToken === "string" &&
+    record.review.reviewToken === record.reviewEpisode?.token;
   const approval = attributed ? { ...record.review! } : null;
   // Left review (it has a review reason) without an attributed approval on record: approved by
-  // corrobo 0.3.x, which kept no record of who approved what, or a record missing its reviewer.
-  // Fail closed: it needs a fresh review.
+  // corrobo 0.3.x or 0.4.0, or a record missing its reviewer or token. Fail closed: it needs a
+  // fresh review.
   const unrecordedApproval = !approval && record.reviewReason !== undefined;
   if (!contract.revalidate && !approval && !unrecordedApproval) {
-    return performAttempt(store, contract, base, request.intent);
+    return performAttempt(store, contract, base, () => freshIntent(request));
   }
 
   // corrobo's own checks of the approval come first; revalidate() only sees a valid one.
@@ -689,18 +1072,22 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
     checkedAt
   };
   if (result.outcome === "proceed") {
-    return performAttempt(store, contract, base, request.intent, { outcome: "proceed", ...checked });
+    return performAttempt(store, contract, base, () => freshIntent(request), { outcome: "proceed", ...checked });
   }
 
   const blockedBy: BlockingCheck = { outcome: result.outcome, ...checked, recordVersion: base.version + 1 };
   const status: OperationStatus | undefined =
     result.outcome === "requiresReview" ? "AWAITING_REVIEW" : result.outcome === "reject" ? "CLOSED" : undefined;
+  const reviewEpisode =
+    result.outcome === "requiresReview"
+      ? await openReviewEpisode(store, base.identity, fingerprintIntent(contract, record.intent), record.reviewEpisode, record.review)
+      : undefined;
   const updated = await store.updateOperation(
     base.identity.id,
     {
       blockedBy,
       ...(status ? { status } : {}),
-      ...(result.outcome === "requiresReview" ? { reviewReason: result.reason } : {})
+      ...(reviewEpisode ? { reviewReason: result.reason, ...reviewEpisodeUpdate(reviewEpisode) } : {})
     },
     base.version
   );
@@ -721,7 +1108,7 @@ async function recoverReservedAttempt<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   record: OperationRecord,
-  intent: Intent,
+  intentOf: () => Intent,
   reserved: ReservedAttempt
 ): Promise<EffectResult<Observation>> {
   const transport: TransportOutcome<Evidence> = {
@@ -733,14 +1120,14 @@ async function recoverReservedAttempt<Intent, Observation, Evidence>(
     }
   };
 
-  const observation = await safeObserve(contract, intent, record.identity, transport, reserved.startedAt);
-  const reconciliation = contract.reconcile({ intent, transport, observation });
+  const { observation, stored } = await safeObserve(contract, intentOf(), record.identity, transport, reserved.startedAt);
+  const reconciliation = safeReconcile(contract, { intent: intentOf(), transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
     reserved,
     transport as TransportOutcome<unknown>,
-    [observation as ObservationResult<unknown>],
+    [stored],
     reconciliation,
     await safetyNow(store)
   );
@@ -763,18 +1150,18 @@ async function reObserve<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   record: OperationRecord,
-  intent: Intent,
+  intentOf: () => Intent,
   latest: ResolvedAttempt
 ): Promise<OperationRecord> {
   const transport = latest.transport as TransportOutcome<Evidence>;
-  const observation = await safeObserve(contract, intent, record.identity, transport, latest.startedAt);
-  const reconciliation = contract.reconcile({ intent, transport, observation });
+  const { observation, stored } = await safeObserve(contract, intentOf(), record.identity, transport, latest.startedAt);
+  const reconciliation = safeReconcile(contract, { intent: intentOf(), transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
     latest,
     latest.transport,
-    [...latest.observations, observation as ObservationResult<unknown>],
+    boundedObservations([...latest.observations, stored]),
     reconciliation,
     await safetyNow(store)
   );
@@ -803,11 +1190,17 @@ export async function runEffect<Intent, Observation, Evidence, Context = unknown
   contract: EffectContract<Intent, Observation, Evidence, Context>,
   input: EffectRequest<Intent, Context>
 ): Promise<EffectResult<Observation>> {
+  validateContract(contract);
   const request = resolveRequest(contract as EffectContract<Intent, unknown, unknown, Context>, input);
   // Read the intent once, first. With the default fingerprint, an intent that can't be stored
   // faithfully as JSON is rejected here, before anything else happens — never after an effect.
   // A contract-supplied fingerprintIntent() takes responsibility for its own intents instead.
   const prepared = prepareIntent(contract, request.intent);
+  // With a custom fingerprint, every hook acts on the stored (JSON) form, from the first call on.
+  if (contract.fingerprintIntent) {
+    (request as { intent: Intent }).intent = prepared.stored as Intent;
+  }
+  request.intentOf = intentCopier(prepared.stored);
   const lock = await store.tryAcquireLock(request.identity.id);
   if (!lock) {
     const existing = await store.getOperation(request.identity.id);
@@ -844,13 +1237,14 @@ export async function runEffect<Intent, Observation, Evidence, Context = unknown
  * call), then let runEffect() act on the operation, which checks the approval again before
  * every attempt. Keeping the two apart means the code that makes attempts can't approve them.
  *
- * - The decision is validated first (a malformed one throws TypeError) and bound to the recorded
- *   intent: if `decision.intentFingerprint` names a different intent, or an approval has already
- *   expired, it throws and nothing changes.
+ * - The decision is validated first (a malformed one throws TypeError), then must answer the
+ *   current review: its `reviewToken` must be the one the AWAITING_REVIEW result reported, and a
+ *   `decidedAt` can't predate this review. If it doesn't, if the operation isn't awaiting review
+ *   at all, if `decision.intentFingerprint` names a different intent, or if an approval has
+ *   already expired, it throws ReviewNotAcceptedError (with `.code` and `.current`) and nothing
+ *   is recorded.
  * - Approved: the operation becomes OPEN; the result says it hasn't been attempted since.
  *   Rejected: CLOSED, terminally.
- * - If the operation isn't awaiting review (already decided, never needed review, closed), the
- *   decision is not recorded and the current state is returned; compare `result.review`.
  * - If another call holds the operation's lock right now, throws OperationBusyError (nothing
  *   recorded). Like runEffect(), it first needs a connection from the store (for PostgresStore,
  *   from your pool), and waits for one if the pool is exhausted; it then re-reads and re-checks
@@ -862,6 +1256,7 @@ export async function reviewEffect<Intent, Observation, Evidence, Context = unkn
   contract: EffectContract<Intent, Observation, Evidence, Context>,
   request: ReviewRequest
 ): Promise<EffectResult<Observation>> {
+  validateContract(contract);
   const identity = resolveIdentity(contract as EffectContract<unknown, unknown, unknown>, request?.identity);
   const decision = parseReviewDecision(request?.decision);
   const lock = await store.tryAcquireLock(identity.id);
@@ -879,10 +1274,24 @@ export async function reviewEffect<Intent, Observation, Evidence, Context = unkn
           `review was made with the "${contract.operationType}" contract; nothing was recorded.`
       );
     }
+    const refuse = (code: ReviewRefusal, message: string): never => {
+      throw new ReviewNotAcceptedError(identity.id, code, message, resultFromRecord(existing));
+    };
+    const episode = openReview(existing);
     if (existing.status !== "AWAITING_REVIEW") {
-      return resultFromRecord(existing);
+      refuse("NOT_AWAITING_REVIEW", `it is ${existing.status}, not awaiting review; see error.current.`);
     }
-    const review = await recordReview(lock.store, contract, existing, decision);
+    if (!episode || decision.reviewToken !== episode.token) {
+      refuse(
+        "STALE_REVIEW_TOKEN",
+        "the decision's reviewToken isn't the current review's. It answers an earlier review, or another " +
+          "operation; show the reviewer the current review (result.reviewToken) instead."
+      );
+    }
+    if (decision.decidedAt !== undefined && Date.parse(decision.decidedAt) < Date.parse(episode!.openedAt)) {
+      refuse("DECIDED_BEFORE_REVIEW_OPENED", `it was decided at ${decision.decidedAt}, before this review began (${episode!.openedAt}).`);
+    }
+    const review = await recordReview(lock.store, contract, existing, decision, refuse);
     const updated = await lock.store.updateOperation(
       identity.id,
       { status: review.decision === "approved" ? "OPEN" : "CLOSED", review },
@@ -892,6 +1301,9 @@ export async function reviewEffect<Intent, Observation, Evidence, Context = unkn
     // what happens next): nothing has been attempted since, the next runEffect() will.
     return review.decision === "approved" ? resultBeforeAttempt(updated, null, approvedNotAttempted(review)) : resultFromRecord(updated);
   } catch (err) {
+    if (err instanceof ReviewNotAcceptedError) {
+      throw err;
+    }
     if (err instanceof StoreConflictError) {
       throw new OperationBusyError(identity.id);
     }
@@ -915,14 +1327,24 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
 
   if (!existing) {
     const auth = contract.authorize
-      ? await contract.authorize(request.intent, { identity: { ...request.identity }, context: request.context })
+      ? validAuthorization(await contract.authorize(freshIntent(request), { identity: { ...request.identity }, context: request.context }))
       : { requiresReview: false };
     const initialStatus: OperationStatus = auth.requiresReview ? "AWAITING_REVIEW" : "OPEN";
     const created = await store.createOperation({
       identity: request.identity,
       intent: prepared.stored,
       status: initialStatus,
-      reviewReason: auth.requiresReview ? (auth.reason ?? defaultReviewReason()) : undefined
+      reviewReason: auth.requiresReview ? (auth.reason ?? defaultReviewReason()) : undefined,
+      ...(auth.requiresReview
+        ? {
+            reviewEpisode: await openReviewEpisode(
+              store,
+              request.identity,
+              prepared.fingerprint ?? fingerprintIntent(contract, prepared.stored as Intent),
+              undefined
+            )
+          }
+        : {})
     });
 
     if (auth.requiresReview) {
@@ -936,11 +1358,29 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
   }
 
   if (existing.status === "AWAITING_REVIEW") {
-    // Decisions are recorded by reviewEffect(); until one is, nothing happens here.
+    // Decisions are recorded by reviewEffect(); until one is, nothing happens here. An operation
+    // awaiting review without an open episode gets a new one now, so a decision has a current
+    // token to carry: it went to review before corrobo kept episodes (0.4.0 and earlier), or its
+    // episode was already answered (a 0.4.0 worker sent it back to review without opening one).
+    if (!openReview(existing)) {
+      const reviewEpisode = await openReviewEpisode(
+        store,
+        existing.identity,
+        fingerprintIntent(contract, existing.intent),
+        existing.reviewEpisode,
+        existing.review
+      );
+      return resultFromRecord(await store.updateOperation(existing.identity.id, reviewEpisodeUpdate(reviewEpisode), existing.version));
+    }
     return resultFromRecord(existing);
   }
 
-  return await continueOpen(store, contract, existing, request);
+  // Act on the recorded intent: the one authorized, approved and attempted so far. A later
+  // request's intent only fingerprinted equal to it: with the default fingerprint it can still
+  // differ in ways JSON doesn't keep (NaN, a Date), and a custom fingerprintIntent() may ignore
+  // fields execute() reads. A later request must never change what is executed.
+  const acting = { ...request, intent: existing.intent as Intent, intentOf: intentCopier<Intent>(existing.intent) };
+  return await continueOpen(store, contract, existing, acting);
 }
 
 /**
@@ -951,22 +1391,27 @@ async function recordReview(
   store: CoordinatedStore,
   contract: EffectContract<any, unknown, unknown, any>,
   record: OperationRecord,
-  decision: ValidDecision
+  decision: ValidDecision,
+  refuse: (code: ReviewRefusal, message: string) => never
 ): Promise<RecordedReview> {
   const intentFingerprint = fingerprintIntent(contract, record.intent);
   if (decision.intentFingerprint !== undefined && decision.intentFingerprint !== intentFingerprint) {
-    throw new Error(
-      `corrobo: this review decision for operation "${record.identity.id}" was made for a different intent than ` +
-        `the one recorded (intentFingerprint doesn't match); nothing was recorded or executed. Show the reviewer the ` +
-        `recorded intent and use fingerprintIntent(contract, intent) on that.`
+    refuse(
+      "INTENT_MISMATCH",
+      "it was made for a different intent than the one recorded (intentFingerprint doesn't match). Show the " +
+        "reviewer the recorded intent and use fingerprintIntent(contract, intent) on that."
     );
   }
   const now = await safetyNow(store);
-  if (decision.expiresAt !== undefined && Date.parse(decision.expiresAt) <= Date.parse(now)) {
-    throw new Error(
-      `corrobo: this approval for operation "${record.identity.id}" expired at ${decision.expiresAt}, before it was ` +
-        `recorded; nothing was recorded or executed.`
-    );
+  if (decision.decision === "approved") {
+    const expiry = approvalExpiry(contract, {
+      expiresAt: decision.expiresAt,
+      decidedAt: decision.decidedAt ?? now,
+      recordedAt: now
+    });
+    if (expiry && Date.parse(expiry.at) <= Date.parse(now)) {
+      refuse("APPROVAL_ALREADY_EXPIRED", `the approval expired at ${expiry.at} (${expiry.because}), before it was recorded.`);
+    }
   }
   const review: RecordedReview = {
     decision: decision.decision,
@@ -974,6 +1419,7 @@ async function recordReview(
     decidedAt: decision.decidedAt ?? now,
     intentFingerprint,
     recordedAt: now,
+    reviewToken: decision.reviewToken,
     attemptCount: record.attempts.length
   };
   if (decision.expiresAt !== undefined) review.expiresAt = decision.expiresAt;
@@ -1000,11 +1446,11 @@ async function continueOpen<Intent, Observation, Evidence, Context>(
   }
 
   if (latest.status === "RESERVED") {
-    return await recoverReservedAttempt(store, contract, existing, request.intent, latest);
+    return await recoverReservedAttempt(store, contract, existing, () => freshIntent(request), latest);
   }
 
   if (latest.evidenceState === "PENDING") {
-    return resultFromRecord(await reObserve(store, contract, existing, request.intent, latest));
+    return resultFromRecord(await reObserve(store, contract, existing, () => freshIntent(request), latest));
   }
 
   if (latest.disposition === "RETRY") {
@@ -1020,7 +1466,7 @@ async function continueOpen<Intent, Observation, Evidence, Context>(
     // under the current rules before any new attempt. A late landing shows up here as APPLIED (→ COMPLETE, no new attempt). This also
     // covers RETRYs recorded without a settlement window (e.g. by corrobo 0.2.x): with no
     // maxInFlightMs they now become INVESTIGATE instead of executing.
-    const settled = await reObserve(store, contract, existing, request.intent, latest);
+    const settled = await reObserve(store, contract, existing, () => freshIntent(request), latest);
     const settledLatest = settled.attempts[settled.attempts.length - 1];
     if (
       settled.status === "OPEN" &&

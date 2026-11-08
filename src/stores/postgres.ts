@@ -9,6 +9,7 @@ import type {
   OperationStatus,
   RecordedReview,
   ReservedAttemptInput,
+  ReviewEpisode,
   TransportOutcome
 } from "../core/types";
 
@@ -17,7 +18,7 @@ const TABLE = "corrobo_operations";
 /**
  * DDL for the single table this store needs. Safe to run repeatedly. The trailing ALTERs
  * upgrade a table created by an earlier corrobo in place: `version` (added in 0.3.0; existing
- * rows start at 0), and `blocked_by` and `review` (0.4.0; nullable).
+ * rows start at 0), `blocked_by` and `review` (0.4.0; nullable) and `review_episode` (0.5.0; nullable).
  */
 export const POSTGRES_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS ${TABLE} (
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS ${TABLE} (
 ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS blocked_by JSONB;
 ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS review JSONB;
+ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS review_episode JSONB;
 `;
 
 interface Row {
@@ -45,6 +47,7 @@ interface Row {
   attempts: AttemptRecord[];
   blocked_by: BlockingCheck | null;
   review: RecordedReview | null;
+  review_episode: ReviewEpisode | null;
   created_at: Date;
   updated_at: Date;
   /** BIGINT: node-postgres returns it as a string. */
@@ -86,6 +89,7 @@ function rowToRecord(row: Row): OperationRecord {
     attempts: row.attempts,
     ...(row.blocked_by ? { blockedBy: row.blocked_by } : {}),
     ...(row.review ? { review: row.review } : {}),
+    ...(row.review_episode ? { reviewEpisode: row.review_episode } : {}),
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     version: Number(row.version)
@@ -166,6 +170,28 @@ function sanitizeObservationForPersistence(observation: ObservationResult<unknow
   };
 }
 
+/**
+ * JSON for an attempt, as Postgres `jsonb` will take it. JSON can carry U+0000 and unpaired
+ * surrogates; `jsonb` rejects them, and an attempt's data comes from hooks after execute(), so a
+ * rejected write would fail again on every pass and leave the attempt RESERVED. They become
+ * U+FFFD. Not used for the intent: it's fingerprinted as given, and is written before anything runs.
+ */
+function jsonbText(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => {
+    if (typeof item === "string") return jsonbSafe(item);
+    if (typeof item === "object" && item !== null && !Array.isArray(item) && Object.keys(item).some((k) => jsonbSafe(k) !== k)) {
+      return Object.fromEntries(Object.entries(item).map(([k, v]) => [jsonbSafe(k), v]));
+    }
+    return item;
+  });
+}
+
+const JSONB_UNSAFE = /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+function jsonbSafe(text: string): string {
+  return text.replace(JSONB_UNSAFE, "\uFFFD");
+}
+
 function isUniqueViolation(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && (err as { code: unknown }).code === "23505";
 }
@@ -195,15 +221,16 @@ async function getOperationImpl(q: Queryable, identityId: string): Promise<Opera
 async function createOperationImpl(q: Queryable, input: NewOperationInput): Promise<OperationRecord> {
   try {
     const result = await q.query<Row>(
-      `INSERT INTO ${TABLE} (id, operation_type, intent, status, review_reason, attempts)
-       VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, '[]'::jsonb)
+      `INSERT INTO ${TABLE} (id, operation_type, intent, status, review_reason, review_episode, attempts)
+       VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6::jsonb, '[]'::jsonb)
        RETURNING *`,
       [
         input.identity.id,
         input.identity.operationType,
         JSON.stringify(input.intent),
         input.status,
-        input.reviewReason ? JSON.stringify(input.reviewReason) : null
+        input.reviewReason ? JSON.stringify(input.reviewReason) : null,
+        input.reviewEpisode ? JSON.stringify(input.reviewEpisode) : null
       ]
     );
     return rowToRecord(result.rows[0]);
@@ -227,7 +254,8 @@ async function reserveAttemptImpl(
     attemptNumber: reserved.attemptNumber,
     startedAt: reserved.startedAt,
     updatedAt: reserved.startedAt,
-    ...(reserved.check ? { check: reserved.check } : {})
+    ...(reserved.check ? { check: reserved.check } : {}),
+    ...(reserved.maxInFlightMs !== undefined ? { maxInFlightMs: reserved.maxInFlightMs } : {})
   };
   const result = await q.query<Row>(
     `UPDATE ${TABLE} SET attempts = attempts || $2::jsonb, updated_at = now(), version = version + 1
@@ -249,7 +277,7 @@ async function appendAttemptImpl(
      SET attempts = attempts || $2::jsonb, status = $3, updated_at = now(), version = version + 1
      WHERE id = $1 AND version = $4
      RETURNING *`,
-    [identityId, JSON.stringify([sanitizeAttemptForPersistence(attempt)]), status, expectedVersion]
+    [identityId, jsonbText([sanitizeAttemptForPersistence(attempt)]), status, expectedVersion]
   );
   return versionedWriteResult(q, identityId, expectedVersion, result.rows[0]);
 }
@@ -269,7 +297,7 @@ async function updateLatestAttemptImpl(
          version = version + 1
      WHERE id = $1 AND version = $4 AND jsonb_array_length(attempts) > 0
      RETURNING *`,
-    [identityId, JSON.stringify(sanitizeAttemptForPersistence(attempt)), status, expectedVersion]
+    [identityId, jsonbText(sanitizeAttemptForPersistence(attempt)), status, expectedVersion]
   );
   return versionedWriteResult(
     q,
@@ -301,7 +329,12 @@ async function setStatusImpl(
 }
 
 /** JSONB columns of the operation itself; each is written only when present in the update. */
-const UPDATABLE_JSON_COLUMNS = { reviewReason: "review_reason", blockedBy: "blocked_by", review: "review" } as const;
+const UPDATABLE_JSON_COLUMNS = {
+  reviewReason: "review_reason",
+  blockedBy: "blocked_by",
+  review: "review",
+  reviewEpisode: "review_episode"
+} as const;
 
 async function updateOperationImpl(
   q: Queryable,

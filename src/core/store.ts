@@ -3,6 +3,7 @@ import type {
   BlockingCheck,
   OperationIdentity,
   RecordedReview,
+  ReviewEpisode,
   OperationRecord,
   OperationStatus,
   ReasonCode,
@@ -39,6 +40,8 @@ export interface NewOperationInput {
   intent: unknown;
   status: OperationStatus;
   reviewReason?: ReasonCode;
+  /** Set when the operation is created already awaiting review. */
+  reviewEpisode?: ReviewEpisode;
 }
 
 /**
@@ -50,6 +53,7 @@ export interface OperationUpdate {
   reviewReason?: ReasonCode | null;
   blockedBy?: BlockingCheck | null;
   review?: RecordedReview | null;
+  reviewEpisode?: ReviewEpisode | null;
 }
 
 /**
@@ -98,7 +102,7 @@ export interface CoordinatedStore {
   /** Applies `update` to the operation's own fields (see OperationUpdate), version-checked like every write. */
   updateOperation(identityId: string, update: OperationUpdate, expectedVersion: number): Promise<OperationRecord>;
 
-  /** @deprecated runEffect() no longer calls this; use updateOperation({ status }). It will be removed in 0.5. */
+  /** @deprecated runEffect() no longer calls this; use updateOperation({ status }). It will be removed in 0.6. */
   setStatus(identityId: string, status: OperationStatus, expectedVersion: number): Promise<OperationRecord>;
 
   /**
@@ -125,8 +129,9 @@ export interface OperationLock {
 export interface EffectStore extends CoordinatedStore {
   /**
    * Non-blocking attempt to become the sole coordinator of this operation identity for the
-   * duration of one runEffect() pass. Returns null immediately if another caller already
-   * holds it — callers MUST NOT wait/retry internally; the loser returns the operation's
+   * duration of one runEffect() pass. Returns null as soon as it finds another caller holding
+   * it (a store may first wait for a connection, e.g. from an exhausted pool, but must not wait
+   * for the lock itself) — callers MUST NOT wait/retry internally; the loser returns the operation's
    * current recorded state (or an "in progress" placeholder) and it is up to the application
    * to call run() again if it needs a fresher answer. Must survive a crash without leaving a
    * permanent lock: PostgresStore uses a session-scoped advisory lock (released automatically

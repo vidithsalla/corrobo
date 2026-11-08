@@ -64,6 +64,11 @@ export interface RetryPolicy {
 export interface ReconciliationResult {
   evidenceState: EvidenceState;
   reason: ReasonCode;
+  /**
+   * What reconcile() found, for the record (a receipt, the refund it located). Stored on the
+   * attempt (ResolvedAttempt.observedEffect) when it's JSON-serializable; otherwise left out,
+   * never failing the pass.
+   */
   observedEffect?: unknown;
 }
 
@@ -99,6 +104,14 @@ export interface RevalidationResult {
  */
 export interface ReviewDecision {
   decision: "approved" | "rejected";
+  /**
+   * The token of the review this decision answers: `EffectResult.reviewToken` from the result
+   * that reported AWAITING_REVIEW, kept with whatever the reviewer was shown. Required. Each
+   * time an operation goes to review it gets a new token, bound to the operation, that review
+   * and the recorded intent, so a decision made on an earlier review screen can't approve a
+   * later review of the same operation.
+   */
+  reviewToken: string;
   /** Who decided, as your app identifies them (a user id, an email). Required, non-empty. */
   reviewer: string;
   /** When they decided (RFC 3339 with Z or an offset). Defaults to when corrobo records it. */
@@ -130,6 +143,8 @@ export interface RecordedReview {
   intentFingerprint: string;
   /** When corrobo recorded it, from the store's clock when it has one. */
   recordedAt: string;
+  /** The review this decision answered (ReviewEpisode.token). */
+  reviewToken: string;
   /**
    * How many attempts were recorded when the decision was. When an approval follows earlier
    * attempts, the next runEffect() re-observes the latest one before executing again: time
@@ -137,6 +152,34 @@ export interface RecordedReview {
    */
   attemptCount: number;
 }
+
+/**
+ * One period of an operation awaiting review. A new one begins every time the operation goes to
+ * review (authorize() at creation, revalidate() asking for review, an approval that expired or
+ * can't be attributed), and only a decision carrying its token is accepted.
+ */
+export interface ReviewEpisode {
+  /** Opaque. Bound to this operation, this episode and the recorded intent. */
+  token: string;
+  /** 1 the first time the operation awaited review, +1 each time after. */
+  generation: number;
+  /** When this review began, from the store's clock. A decision dated earlier was made for something else. */
+  openedAt: string;
+  /**
+   * A decision without a token (recorded by corrobo 0.4.0) that was on record when this review
+   * opened. It is moved here, out of OperationRecord.review, because it predates this review and
+   * never answers it; kept for the audit trail. Any tokenless decision on the record after that
+   * was written later, so it answers this review.
+   */
+  supersededDecision?: TokenlessReview;
+}
+
+/** A decision recorded by corrobo 0.4.0, which kept no review token (or reviewer, or attempt count, in some records). */
+export type TokenlessReview = Omit<RecordedReview, "reviewToken" | "reviewer" | "attemptCount"> & {
+  reviewToken?: undefined;
+  reviewer: string | null;
+  attemptCount?: number;
+};
 
 /** What reviewEffect() takes: which operation, and the reviewer's decision on it. */
 export interface ReviewRequest {
@@ -146,6 +189,11 @@ export interface ReviewRequest {
 }
 
 export interface RevalidateInput<Intent, Context> {
+  /**
+   * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
+   * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
+   * Changing it changes nothing else.
+   */
   intent: Intent;
   identity: OperationIdentity;
   /** The attempt about to be made: 1 for the first. */
@@ -194,12 +242,22 @@ export interface BlockingCheck extends PreExecuteCheck {
 }
 
 export interface ExecuteInput<Intent> {
+  /**
+   * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
+   * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
+   * Changing it changes nothing else.
+   */
   intent: Intent;
   identity: OperationIdentity;
   attemptNumber: number;
 }
 
 export interface ObserveInput<Intent, Evidence> {
+  /**
+   * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
+   * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
+   * Changing it changes nothing else.
+   */
   intent: Intent;
   identity: OperationIdentity;
   transport: TransportOutcome<Evidence>;
@@ -213,6 +271,11 @@ export interface ObserveInput<Intent, Evidence> {
 }
 
 export interface ReconcileInput<Intent, Observation, Evidence> {
+  /**
+   * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
+   * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
+   * Changing it changes nothing else.
+   */
   intent: Intent;
   transport: TransportOutcome<Evidence>;
   observation: ObservationResult<Observation>;
@@ -228,7 +291,8 @@ export interface EffectContract<Intent, Observation, Evidence, Context = unknown
    * human sign-off before anything is executed? Returning requiresReview:true produces
    * disposition REVIEW directly — a known action needing authorization, never a
    * reconciliation outcome. Whether it is still valid to act at the moment of each attempt is
-   * revalidate()'s question, not this one's.
+   * revalidate()'s question, not this one's. `intent` is its own copy of the stored JSON form
+   * (see ExecuteInput.intent).
    */
   authorize?(intent: Intent, input: AuthorizeInput<Context>): AuthorizationResult | Promise<AuthorizationResult>;
   /**
@@ -257,6 +321,11 @@ export interface EffectContract<Intent, Observation, Evidence, Context = unknown
    * stable, key-sorted JSON serialization (src/core/fingerprint.ts) when omitted — provide
    * this only if that default would treat two meaningfully-different intents as equal, or
    * two meaningfully-equal intents as different, for this operation type.
+   *
+   * With a custom fingerprint, once the operation is recorded every later call acts on the
+   * recorded intent (as the store returns it: from PostgresStore, its JSON form), never on the
+   * later request's: two intents your fingerprint calls equal are the same operation, and the
+   * one that was recorded (and reviewed) is the one executed.
    */
   fingerprintIntent?(intent: Intent): string;
   /**
@@ -276,6 +345,15 @@ export interface EffectContract<Intent, Observation, Evidence, Context = unknown
    *   key that stays the same across attempts) or the request provably never left the process.
    */
   maxInFlightMs?: number;
+  /**
+   * The longest an approval for this operation type is good for, in milliseconds, counted from
+   * when it was decided (or recorded, if that was earlier). It applies whether or not the
+   * decision has its own `expiresAt` (the earlier of the two wins), so a review screen that
+   * forgets to set one can't produce an approval that never expires. An approval that ages out
+   * before an attempt sends the operation back to review (APPROVAL_EXPIRED). Omit it to let
+   * approvals without `expiresAt` cover every later attempt.
+   */
+  maxApprovalAgeMs?: number;
 }
 
 /** An attempt whose outcome is not yet known — persisted BEFORE execute() is ever called. */
@@ -286,6 +364,12 @@ export interface ReservedAttempt {
   updatedAt: string;
   /** What was checked before this attempt (see PreExecuteCheck), when anything was. */
   check?: PreExecuteCheck;
+  /**
+   * The contract's maxInFlightMs when this attempt started. Settlement for this attempt never
+   * uses a shorter window, even if a later deploy declares one (a request already in flight
+   * can still take as long as the window it was sent under).
+   */
+  maxInFlightMs?: number;
 }
 
 /** An attempt whose outcome has been established via execute()/observe()/reconcile(). */
@@ -295,8 +379,14 @@ export interface ResolvedAttempt {
   startedAt: string;
   updatedAt: string;
   transport: TransportOutcome<unknown>;
-  /** More than one entry only when re-observed while evidenceState was PENDING. */
+  /**
+   * More than one entry only when re-observed (while PENDING, or settling before a retry). Kept
+   * bounded: the first observation and the most recent ones (at most 20 in all), so an
+   * operation that stays PENDING for a long time doesn't grow its record without limit.
+   */
   observations: ObservationResult<unknown>[];
+  /** reconcile()'s observedEffect from the latest observation, when it was JSON-serializable. */
+  observedEffect?: unknown;
   evidenceState: EvidenceState;
   /** Why the evidence state was determined (from reconcile()). */
   evidenceReason: ReasonCode;
@@ -312,6 +402,12 @@ export interface ResolvedAttempt {
   retryNotBefore?: string;
   /** What was checked before this attempt (see PreExecuteCheck), when anything was. */
   check?: PreExecuteCheck;
+  /**
+   * The contract's maxInFlightMs when this attempt started. Settlement for this attempt never
+   * uses a shorter window, even if a later deploy declares one (a request already in flight
+   * can still take as long as the window it was sent under).
+   */
+  maxInFlightMs?: number;
 }
 
 /**
@@ -329,6 +425,8 @@ export interface ReservedAttemptInput {
   startedAt: string;
   /** Must be stored on the reserved attempt when present. */
   check?: PreExecuteCheck;
+  /** Must be stored on the reserved attempt when present (see ReservedAttempt.maxInFlightMs). */
+  maxInFlightMs?: number;
 }
 
 export interface OperationRecord {
@@ -342,6 +440,8 @@ export interface OperationRecord {
   blockedBy?: BlockingCheck;
   /** The latest review decision, when the operation went through review. */
   review?: RecordedReview;
+  /** The current (or latest) review, when the operation has awaited review. */
+  reviewEpisode?: ReviewEpisode;
   createdAt: string;
   updatedAt: string;
   /**
@@ -384,4 +484,9 @@ export interface EffectResult<Observation> {
   retryNotBefore: string | null;
   /** The latest review decision on this operation (OperationRecord.review), or null. */
   review: RecordedReview | null;
+  /**
+   * While AWAITING_REVIEW: the token a decision on this review must carry (ReviewDecision.
+   * reviewToken). Keep it with what you show the reviewer. null otherwise.
+   */
+  reviewToken: string | null;
 }

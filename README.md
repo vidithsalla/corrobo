@@ -7,7 +7,13 @@
 
 Your code issued a refund, sent a message, opened a ticket, or merged a PR, and the connection dropped before the answer came back. Maybe it failed. Maybe the provider did it and only the response got lost. Retry blindly and you might do it twice.
 
-corrobo is a small TypeScript library for that moment. It records the operation before making the call, then asks the external system what actually happened, and decides from that evidence whether doing it again is safe.
+corrobo is a small TypeScript library for that moment. It records the operation before making the call, then asks the external system what actually happened, and decides from that evidence whether to do it again.
+
+For actions an agent shouldn't take alone, it can also require a person's sign-off first. The approval answers one review, can expire, and is checked again before every retry ([human review](#human-review-before-an-action)).
+
+**Use it when** a call changes something outside your process (a payment, a message, a ticket), a timeout or crash can leave you unsure whether it happened, and the other system lets you look the result up afterwards.
+
+**You don't need it** for reads, for writes inside your own database transaction, or when the provider deduplicates every retry on an idempotency key for as long as you'll retry ([when keys are enough](#idempotency-keys-and-durable-workflows)). If the other system can't be asked what happened at all, corrobo can only tell you it doesn't know (`UNKNOWN`) and stop.
 
 ```
 execute  →  observe  →  reconcile  →  recover
@@ -15,7 +21,7 @@ execute  →  observe  →  reconcile  →  recover
 
 ![npm run demo: after a lost response, the naive retry credits the account twice; corrobo checks the ledger and credits once](https://raw.githubusercontent.com/vidithsalla/corrobo/main/docs/assets/timeout-after-write.svg)
 
-That's `npm run demo` in this repo: a real local HTTP ledger commits a credit, then drops the connection. Both counts come from the ledger's own API, not from corrobo.
+That's `npm run demo` in this repo (clone it, then `npm ci && npm run demo`; no API keys or services needed): a real local HTTP ledger commits a credit, then drops the connection. Both counts come from the ledger's own API, not from corrobo.
 
 ```
 npm install corrobo
@@ -23,7 +29,7 @@ npm install corrobo
 
 ## Quickstart
 
-Wrap one consequential call in an *effect contract*: how to do it, how to check it, and how to judge what you see. Here `payments` is your API client (in the runnable version, [`examples/quickstart`](examples/quickstart), it's a stand-in that loses the response after refunding).
+Wrap one consequential call in an *effect contract*: how to do it, how to check it, and how to judge what you see. Here `payments` is your API client. To run this exact code with a stand-in client that loses the response after refunding, clone the repo and run `npm ci && npm run quickstart` ([`examples/quickstart`](examples/quickstart)).
 
 ```ts
 import { runEffect, InMemoryStore, defineContract, observed, reconciled } from "corrobo";
@@ -37,16 +43,21 @@ const refundOrder = defineContract<{ orderId: string; amountCents: number }>()({
   execute: ({ intent, identity }) => payments.createRefund({ ...intent, reference: identity.id }),
 
   // 2. Ask the API what is actually true. Never infer it from execute()'s outcome.
+  //    authoritative: this lookup sees a refund the moment it's made, so "none found" proves
+  //    none. For a search that can lag, pass false and treat "none found" as UNKNOWN.
   observe: async ({ identity }) =>
-    observed((await payments.findRefunds(identity.id)).length, { source: "payments.findRefunds", authoritative: true }),
+    observed(await payments.findRefunds(identity.id), { source: "payments.findRefunds", authoritative: true }),
 
   // 3. Compare what you intended with what you observed.
-  reconcile: ({ observation }) => {
+  reconcile: ({ intent, observation }) => {
     if (observation.status !== "observed") return reconciled("UNKNOWN", "NO_READ", "Could not read refunds.");
-    const found = observation.data;
-    if (found === 0) return reconciled("NOT_APPLIED", "NO_REFUND", "No refund exists.");
-    if (found === 1) return reconciled("APPLIED", "REFUNDED", "Exactly one refund exists.");
-    return reconciled("CONFLICTED", "DUPLICATES", `${found} refunds exist.`);
+    const refunds = observation.data;
+    if (refunds.length === 0) return reconciled("NOT_APPLIED", "NO_REFUND", "No refund exists.");
+    const [refund] = refunds;
+    if (refunds.length === 1 && refund.orderId === intent.orderId && refund.amountCents === intent.amountCents) {
+      return reconciled("APPLIED", "REFUNDED", "The intended refund exists.");
+    }
+    return reconciled("CONFLICTED", "UNEXPECTED_REFUNDS", `${refunds.length} refund(s) don't match the plan.`);
   }
 });
 
@@ -54,16 +65,20 @@ async function main() {
   payments.loseNextResponse(); // the refund goes through, but the response is lost
 
   const result = await runEffect(new InMemoryStore(), refundOrder, {
-    identity: "refund-order-1001",
+    identity: "refund-request-8421", // minted once, when the refund was requested, and stored with it
     intent: { orderId: "1001", amountCents: 5_000 }
   });
 
   console.log(result.evidenceState, result.disposition); // APPLIED COMPLETE
   console.log("refunds made:", payments.refundCount()); // refunds made: 1
 }
+
+main();
 ```
 
 `execute()` threw, but corrobo didn't treat that as "not refunded": it asked, found the refund, and finished. Call `runEffect` again with the same store and `identity` (say, from a retry loop) and it returns the recorded result instead of refunding again. A new refund needs a new identity.
+
+`observe()` must only read: corrobo calls it during recovery and re-checks, where nothing may be executed, so it must never be able to create the effect (don't re-send the request from it, even with an idempotency key).
 
 `InMemoryStore` is for trying things out: it forgets everything when the process exits, so a restarted worker would see the refund as new. For anything where a restart or a second worker matters, use [`PostgresStore`](#in-production-postgresstore).
 
@@ -89,11 +104,25 @@ Two answers, kept separate on purpose: what the evidence shows, and what's safe 
 | `PENDING` | Accepted, not final yet | none yet: call again later; while it stays `PENDING`, corrobo re-checks instead of re-executing |
 | `UNKNOWN` | It couldn't find out | `INVESTIGATE`, never a blind retry |
 
-Plus `REVIEW`: an optional `authorize()` hook can require human sign-off *before* anything is executed; a reviewer can approve or reject. Your review screen records the decision with `reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer, expiresAt } })`, which never executes anything; your worker's next `runEffect()` acts on it. A decision records who made it and when, can carry an expiry, and is bound to the exact intent that was reviewed, and corrobo checks it again before every attempt it allows ([spec §M](docs/v0.1-spec.md#m-review-decisions)). Keeping the two calls apart means the code that makes attempts (an agent's tools, a worker) has no way to approve them: `runEffect()` takes no decision at all. Call `reviewEffect()` only from your own review flow, never from anything a model can call.
+**Requests can land late.** A timed-out request isn't undone, it's just unanswered, and it can still be applied after corrobo first looks. So when a failed call is followed by `NOT_APPLIED` while that request could still land, the `RETRY` comes with a `retryNotBefore` time (your declared `maxInFlightMs` after the attempt started): calling earlier does nothing, and calling after it makes corrobo check once more before it executes again. If you don't declare `maxInFlightMs`, the answer is `INVESTIGATE`. Details: [spec §O](docs/v0.1-spec.md#o-fencing-and-settlement-when-the-lock-is-not-enough).
+
+Choosing `maxInFlightMs`:
+
+| Your provider | `maxInFlightMs` |
+|---|---|
+| Deduplicates on an idempotency key you send on every attempt, for as long as you'll retry | `0` |
+| Says how long it can take to apply a request | your request timeout plus that bound |
+| Doesn't say | leave it out: an ambiguous failure becomes `INVESTIGATE` instead of a retry |
+
+Too short is the dangerous direction: a retry can then race a request that's still landing. `verifyEffectContract()` catches a window shorter than your fake's late landing.
+
+## Human review before an action
+
+An optional `authorize()` hook can require human sign-off *before* anything is executed (the `REVIEW` disposition); a reviewer can approve or reject. The result that reports `AWAITING_REVIEW` carries a `reviewToken`; keep it with what you show the reviewer. Your review screen records the decision with `reviewEffect(store, contract, { identity, decision: { decision: "approved", reviewer, reviewToken, expiresAt } })`, which never executes anything, and your worker's next `runEffect()` acts on it. A decision records who made it and when, can carry an expiry (and a contract's `maxApprovalAgeMs` caps how old any approval may be), and answers exactly one review: a decision made on an earlier review's screen, or dated before the current review began, is refused. corrobo checks the approval again before every attempt it allows ([spec §M](docs/v0.1-spec.md#m-review-decisions)).
+
+`runEffect()` takes no decision at all, so code that only makes attempts can't approve them. That's an API boundary, not a privilege boundary: any code with the same store and contract can call `reviewEffect()` and name any reviewer. It lets you separate the capabilities (run `reviewEffect()` only in your review service, under its own database role, behind your own authentication), but it doesn't do that for you. Never expose it to anything a model can call.
 
 **Checking again before each attempt.** An approval given now, or a retry an hour from now, can act on a world that has changed: the order was cancelled, the agent's scope was revoked. An optional `revalidate()` hook runs right before every attempt, including the first, with the current caller's `context`, and can let it `proceed`, send it to `requiresReview`, or `reject` it (`REPLAN`). It never blocks corrobo from finding out what an earlier attempt did, and if it throws, nothing runs. It narrows the gap between checking and acting but can't close it, so use the provider's conditional writes too where it has them. Details: [spec §M.1](docs/v0.1-spec.md#m1-revalidation-before-each-attempt).
-
-**Requests can land late.** A timed-out request isn't undone, it's just unanswered, and it can still be applied after corrobo first looks. So when a failed call is followed by `NOT_APPLIED` while that request could still land, the `RETRY` comes with a `retryNotBefore` time (your declared `maxInFlightMs` after the attempt started): calling earlier does nothing, and calling after it makes corrobo check once more before it executes again. If you don't declare `maxInFlightMs`, the answer is `INVESTIGATE`. Details: [spec §O](docs/v0.1-spec.md#o-fencing-and-settlement-when-the-lock-is-not-enough).
 
 ## Test your contract
 
@@ -122,8 +151,9 @@ npm install corrobo pg
 import { Pool } from "pg";
 import { PostgresStore } from "corrobo/postgres";
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-await PostgresStore.migrate(pool); // creates (or upgrades) the one table it needs; idempotent
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, connectionTimeoutMillis: 5_000 });
+pool.on("error", (err) => console.error("postgres pool error", err)); // an idle client's failover error must not crash the process
+await PostgresStore.migrate(pool); // creates (or upgrades) its table; idempotent. In production, run it as a deploy step with a lock_timeout (docs/operations.md)
 
 const store = new PostgresStore(pool, { acknowledgePersistence: true });
 ```
@@ -131,8 +161,9 @@ const store = new PostgresStore(pool, { acknowledgePersistence: true });
 - **Crash safety:** the attempt is recorded before `execute()` runs, so a restart never mistakes "attempted, outcome unknown" for "never attempted". It checks the external system first.
 - **Concurrency:** callers racing on the same identity are coordinated with a Postgres advisory lock; different identities run in parallel. Each operation in flight holds one pool connection for its whole pass, so size `max` on your `Pool` for the operations you run at once, plus whatever else uses that pool.
 - **Lost locks:** if the lock's connection dies while `execute()` is still running, version-checked writes keep the stale caller from overwriting anything, and the late-landing rule keeps the next caller from re-executing too early. Time windows use the database's clock, so skew between hosts doesn't matter.
+- **Before you run it for real:** [running corrobo in production](docs/operations.md): pool and hook timeouts, migrations, retention (deleting a row lets its identity execute again), and SQL to find operations that need a call.
 - `acknowledgePersistence: true` is required on purpose: this store keeps what your contracts produce, with no automatic expiry (see [privacy](#privacy-and-data-handling)).
-- **Upgrading:** drain workers on the old version first, then run `migrate()` once. From 0.3.x it adds two nullable columns, and operations approved under 0.3.x need a new review before any further attempt; see the [changelog](CHANGELOG.md). From 0.2.x, see also the [0.3 upgrade notes](docs/v0.1-spec.md#o-fencing-and-settlement-when-the-lock-is-not-enough).
+- **Upgrading:** drain workers on the old version first, then run `migrate()` once. From 0.4.0 or 0.3.x it adds nullable columns, and unfinished operations approved by those versions need a new review before any further attempt; see the [changelog](CHANGELOG.md). From 0.2.x, see also the [0.3 upgrade notes](docs/v0.1-spec.md#o-fencing-and-settlement-when-the-lock-is-not-enough).
 
 ## Guarantees
 
@@ -164,6 +195,7 @@ Two things it would be wrong to claim: that corrobo never handles personal data 
 - **[`examples/stripe-refund`](examples/stripe-refund)** — Stripe refunds with idempotency keys and corrobo together, including the key's retention window. `npm run example:stripe` runs against a fake Stripe (no network); an optional test-mode smoke script needs `sk_test_` credentials.
 - **[`examples/rest`](examples/rest)** — a plain HTTP order cancellation: conflict, `PENDING`, `UNKNOWN`. `npm run example:rest`.
 - **[`examples/jev-refund`](examples/jev-refund)** — a model-based risk judgment feeding `authorize()` before execution, while corrobo alone decides what happened after. [Write-up](docs/jev-integration.md). `npm run example:jev` (no API key needed).
+- **[`examples/agent-tool-retry`](examples/agent-tool-retry)** — `npm run example:agent-retry`: a model retries a refund tool that timed out after the refund went through. Keying on `toolCallId` (or using it as the idempotency key) still refunds twice, because the retry is a new tool call; keying on the decision refunds once.
 
 ## Agent Skill
 
