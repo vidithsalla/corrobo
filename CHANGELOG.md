@@ -1,10 +1,17 @@
 # Changelog
 
-## Unreleased
+## Unreleased (0.6.0)
+
+Hooks now act only on the recorded intent. This fixes an approval-binding bug and changes what hooks receive (see Breaking).
 
 ### Security
 
-- **A hook that changed its `intent` could change what was executed (0.5.1 and earlier).** Every hook received the same intent object, so if `revalidate()` or `authorize()` modified it (`intent.amountCents = 500_000`), `execute()` sent the modified amount while the operation's recorded, approved intent stayed `5000`, and the attempt carried the approval for `5000`. The same applied to the caller changing its own object while `runEffect()` was running. Now each hook gets its own copy of one reading of the intent taken when `runEffect()` is called (Dates stay Dates; an intent a structured clone can't copy, such as one with an own `toJSON()`, is copied as its stored JSON form), and `revalidate()` gets its own copy of the record. Hooks that relied on changing the intent to pass data to a later hook must pass it some other way. Reported with reproductions by Ömer Faruk Koç (#46).
+- **A hook that changed its `intent` could change what was executed (0.5.1 and earlier).** Every hook received the same intent object, so if `revalidate()` or `authorize()` modified it (`intent.amountCents = 500_000`), `execute()` sent the modified amount while the operation's recorded, approved intent stayed `5000`, and the attempt carried the approval for `5000`. The caller changing its own object while `runEffect()` was running did the same, and with the default fingerprint a later request that only fingerprinted equal to the recorded intent (`NaN` and the recorded `null`) was what `execute()` received. Now every hook gets its own fresh copy of the recorded intent as stored, and `revalidate()` its own copy of the record. Reported with reproductions by Ömer Faruk Koç (#46).
+
+### Breaking
+
+- **Hooks receive the stored (JSON) form of the intent with the default fingerprint too,** as they already did with a custom `fingerprintIntent()`. A `Date` arrives as its ISO string, a class instance as plain data without its methods, and an object with `toJSON()` as that method's result. Contracts whose `execute()` reads such values as objects (`intent.when.getTime()`) must parse them (`new Date(intent.when)`). Hooks that changed the intent to pass data to a later hook must pass it another way.
+- `revalidate()`'s `record` no longer includes raw thrown errors (`error.raw`) with `InMemoryStore`, matching `PostgresStore`.
 
 ## 0.5.1 — 2026-10-05
 

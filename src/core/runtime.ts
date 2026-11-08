@@ -131,20 +131,42 @@ type ResolvedRequest<Intent, Context = unknown> = Omit<EffectRequest<Intent, Con
 };
 
 /**
- * Each hook gets its own copy of the intent, taken from one reading made when runEffect() was
- * called, so no hook (and no later change to the caller's object) can alter what another hook,
- * execute() included, receives: an approval for one intent can't be spent on another. The
- * copy keeps Dates as Dates; an intent a structured clone can't copy (an own toJSON(), say)
- * is copied as its stored JSON form instead.
+ * Each hook gets its own copy of the recorded intent, as stored (its JSON form): the intent that
+ * was authorized, reviewed and fingerprinted, never the caller's object. So no hook, and no later
+ * change to the caller's object, can alter what another hook (execute() included) receives, and
+ * an approval for one intent can't be spent on another. Two objects that fingerprint the same
+ * but differ (NaN and null, a Date and its ISO string) can't diverge here either: hooks only ever
+ * see the stored form.
  */
-function intentCopier<Intent>(intent: Intent, stored: unknown): () => Intent {
-  let source: unknown;
+function intentCopier<Intent>(recorded: unknown): () => Intent {
+  const json = JSON.stringify(recorded);
+  return () => JSON.parse(json) as Intent;
+}
+
+/**
+ * The record revalidate() is handed: its own copy, so editing it can't change the checks corrobo
+ * makes after the hook. Raw thrown errors (kept only by InMemoryStore) are left out; PostgresStore
+ * never stores them either.
+ */
+function recordForHook(record: OperationRecord): OperationRecord {
+  const withoutRaw = (error: { message: string; raw?: unknown }) => ({ message: error.message });
+  const attempts = record.attempts.map((attempt) =>
+    attempt.status !== "RESOLVED"
+      ? attempt
+      : {
+          ...attempt,
+          transport: attempt.transport.ok ? attempt.transport : { ok: false as const, error: withoutRaw(attempt.transport.error) },
+          observations: attempt.observations.map((o) =>
+            o.status === "observation_failed" ? { ...o, error: withoutRaw(o.error) } : o
+          )
+        }
+  );
+  const stripped = { ...record, attempts };
   try {
-    source = structuredClone(intent);
+    return structuredClone(stripped);
   } catch {
-    source = stored;
+    return JSON.parse(JSON.stringify(stripped)) as OperationRecord;
   }
-  return () => structuredClone(source) as Intent;
 }
 
 /** The intent a hook receives: its own copy (see intentCopier). */
@@ -971,7 +993,7 @@ async function runRevalidate<Intent, Context>(
       attemptNumber,
       approval: approval ? { ...approval } : null,
       // Its own copy: corrobo checks the approval against this record again after the hook.
-      record: structuredClone(record),
+      record: recordForHook(record),
       context: request.context
     });
     // Read each field once, inside the try: a throwing getter fails closed like a throw.
@@ -1178,7 +1200,7 @@ export async function runEffect<Intent, Observation, Evidence, Context = unknown
   if (contract.fingerprintIntent) {
     (request as { intent: Intent }).intent = prepared.stored as Intent;
   }
-  request.intentOf = intentCopier(request.intent, prepared.stored);
+  request.intentOf = intentCopier(prepared.stored);
   const lock = await store.tryAcquireLock(request.identity.id);
   if (!lock) {
     const existing = await store.getOperation(request.identity.id);
@@ -1353,13 +1375,11 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
     return resultFromRecord(existing);
   }
 
-  // Act on the recorded intent: the one authorized, approved and attempted so far. With the
-  // default fingerprint a later request's intent is the same data (it fingerprinted equal to the
-  // stored JSON form), but a custom fingerprintIntent() may call two intents "equal" while
-  // ignoring fields execute() reads; a later request must never change what is executed.
-  const acting = contract.fingerprintIntent
-    ? { ...request, intent: existing.intent as Intent, intentOf: intentCopier(existing.intent as Intent, existing.intent) }
-    : request;
+  // Act on the recorded intent: the one authorized, approved and attempted so far. A later
+  // request's intent only fingerprinted equal to it: with the default fingerprint it can still
+  // differ in ways JSON doesn't keep (NaN, a Date), and a custom fingerprintIntent() may ignore
+  // fields execute() reads. A later request must never change what is executed.
+  const acting = { ...request, intent: existing.intent as Intent, intentOf: intentCopier<Intent>(existing.intent) };
   return await continueOpen(store, contract, existing, acting);
 }
 

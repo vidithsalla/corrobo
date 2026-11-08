@@ -163,10 +163,10 @@ describe.each(storeCases())("%s: hooks can't change the intent another hook rece
 });
 
 describe("what hooks receive", () => {
-  it("with the default fingerprint, a Date in the intent still arrives as a Date, in a copy of its own", async () => {
+  it("hooks receive the recorded form: a Date arrives as its stored ISO string, not the caller's object", async () => {
     const when = new Date("2026-11-07T12:00:00.000Z");
     const received: unknown[] = [];
-    const contract = defineContract<{ when: Date }>()({
+    const contract = defineContract<{ when: Date | string }>()({
       operationType: "ledger/credit",
       retryPolicy: { maxAttempts: 1, retryOnNotApplied: false },
       execute: async ({ intent }) => {
@@ -175,10 +175,93 @@ describe("what hooks receive", () => {
       observe: async () => observed(1, { source: "ledger", authoritative: true }),
       reconcile: () => reconciled("APPLIED", "DONE", "Done")
     });
-    await runEffect(new InMemoryStore(), contract, { identity: "d1", intent: { when } });
-    expect(received[0]).toBeInstanceOf(Date);
-    expect((received[0] as Date).toISOString()).toBe(when.toISOString());
-    expect(received[0]).not.toBe(when);
+    const store = new InMemoryStore();
+    await runEffect(store, contract, { identity: "d1", intent: { when } });
+    expect(received).toEqual([when.toISOString()]);
+    expect((await store.getOperation("d1"))!.intent).toEqual({ when: when.toISOString() });
+  });
+
+  it("a later request that only fingerprints equal (NaN vs the recorded null) can't change what execute() sends", async () => {
+    const sent: unknown[] = [];
+    let first = true;
+    const contract = defineContract<{ n: number | null }>()({
+      operationType: "ledger/credit",
+      retryPolicy: { maxAttempts: 2, retryOnNotApplied: true },
+      authorize: () => ({ requiresReview: true }),
+      execute: async ({ intent }) => {
+        sent.push(intent.n);
+      },
+      observe: async () => (first ? ((first = false), observed(0, { source: "ledger", authoritative: true })) : observed(1, { source: "ledger", authoritative: true })),
+      reconcile: ({ observation }) =>
+        observation.status === "observed" && observation.data > 0 ? reconciled("APPLIED", "DONE", "Done") : reconciled("NOT_APPLIED", "NONE", "None")
+    });
+    const store = new InMemoryStore();
+    const waiting = await runEffect(store, contract, { identity: "n1", intent: { n: null } });
+    await reviewEffect(store, contract, { identity: "n1", decision: { decision: "approved", reviewToken: waiting.reviewToken!, reviewer: "alice" } });
+    await runEffect(store, contract, { identity: "n1", intent: { n: Number.NaN } });
+    expect(sent).toEqual([null]);
+  });
+
+  it("a SharedArrayBuffer in the intent can't carry a hook's write into execute()", async () => {
+    const shared = new SharedArrayBuffer(16);
+    const seen: unknown[] = [];
+    const contract = defineContract<{ buf: unknown }>()({
+      operationType: "ledger/credit",
+      retryPolicy: { maxAttempts: 1, retryOnNotApplied: false },
+      authorize: ({ buf }) => {
+        if (buf instanceof SharedArrayBuffer) new Uint8Array(buf)[0] = 9;
+        return { requiresReview: false };
+      },
+      execute: async ({ intent }) => {
+        seen.push(intent.buf);
+      },
+      observe: async () => observed(1, { source: "ledger", authoritative: true }),
+      reconcile: () => reconciled("APPLIED", "DONE", "Done")
+    });
+    await runEffect(new InMemoryStore(), contract, { identity: "s1", intent: { buf: shared } });
+    expect(new Uint8Array(shared)[0]).toBe(0);
+    expect(seen).toEqual([{}]);
+  });
+
+  it("an intent with an own toJSON() reaches hooks as its JSON form, the form that was recorded", async () => {
+    const seen: unknown[] = [];
+    const contract = defineContract<{ amountCents: number }>()({
+      operationType: "ledger/credit",
+      retryPolicy: { maxAttempts: 1, retryOnNotApplied: false },
+      fingerprintIntent: (i) => String(i.amountCents),
+      execute: async ({ intent }) => {
+        seen.push(intent);
+      },
+      observe: async () => observed(1, { source: "ledger", authoritative: true }),
+      reconcile: () => reconciled("APPLIED", "DONE", "Done")
+    });
+    const intent = { amountCents: 100, toJSON: () => ({ amountCents: 100 }) };
+    await runEffect(new InMemoryStore(), contract, { identity: "j1", intent });
+    expect(seen).toEqual([{ amountCents: 100 }]);
+  });
+
+  it("a retry after an attempt whose raw error can't be cloned still runs revalidate() (InMemoryStore keeps raw errors)", async () => {
+    let attempt = 0;
+    const revalidated: number[] = [];
+    const contract = defineContract<Credit>()({
+      operationType: "ledger/credit",
+      retryPolicy: { maxAttempts: 2, retryOnNotApplied: true },
+      maxInFlightMs: 0,
+      revalidate: ({ attemptNumber }) => (revalidated.push(attemptNumber), { decision: "proceed" }),
+      execute: async () => {
+        attempt += 1;
+        if (attempt === 1) throw { message: "timeout", retryHook() {} }; // a plain object a structured clone can't copy
+      },
+      observe: async () => observed(attempt > 1 ? 1 : 0, { source: "ledger", authoritative: true }),
+      reconcile: ({ observation }) =>
+        observation.status === "observed" && observation.data > 0 ? reconciled("APPLIED", "DONE", "Done") : reconciled("NOT_APPLIED", "NONE", "None")
+    });
+    const store = new InMemoryStore();
+    const first = await runEffect(store, contract, { identity: "r1", intent: { amountCents: 5_000 } });
+    expect(first.disposition).toBe("RETRY");
+    const second = await runEffect(store, contract, { identity: "r1", intent: { amountCents: 5_000 } });
+    expect(revalidated).toEqual([1, 2]);
+    expect(second.disposition).toBe("COMPLETE");
   });
 
   it("with a custom fingerprint, a hook's mutation doesn't reach execute() either", async () => {
