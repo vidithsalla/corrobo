@@ -195,6 +195,7 @@ Two things it would be wrong to claim: that corrobo never handles personal data 
 - **[`examples/stripe-refund`](examples/stripe-refund)** — Stripe refunds with idempotency keys and corrobo together, including the key's retention window. `npm run example:stripe` runs against a fake Stripe (no network); an optional test-mode smoke script needs `sk_test_` credentials.
 - **[`examples/rest`](examples/rest)** — a plain HTTP order cancellation: conflict, `PENDING`, `UNKNOWN`. `npm run example:rest`.
 - **[`examples/jev-refund`](examples/jev-refund)** — a model-based risk judgment feeding `authorize()` before execution, while corrobo alone decides what happened after. [Write-up](docs/jev-integration.md). `npm run example:jev` (no API key needed).
+- **[`examples/agent-tool-retry`](examples/agent-tool-retry)** — `npm run example:agent-retry`: a model retries a refund tool that timed out after the refund went through. Keying on `toolCallId` (or using it as the idempotency key) still refunds twice, because the retry is a new tool call; keying on the decision refunds once.
 
 ## Agent Skill
 
