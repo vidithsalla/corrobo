@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased (0.6.0)
+## 0.6.0 — 2026-11-08
 
-Hooks now act only on the recorded intent. This fixes an approval-binding bug and changes what hooks receive (see Breaking).
+Hooks now act only on the recorded intent. This fixes an approval-binding bug in 0.5.1 and earlier, and changes what hooks receive (see Breaking). Upgrade if you use review or `revalidate()`. No schema change: no `migrate()` needed, and 0.5.x and 0.6.0 workers can share a table during a rolling deploy (records are unchanged; only what hooks receive differs).
 
 ### Security
 
@@ -12,6 +12,16 @@ Hooks now act only on the recorded intent. This fixes an approval-binding bug an
 
 - **Hooks receive the stored (JSON) form of the intent with the default fingerprint too,** as they already did with a custom `fingerprintIntent()`. A `Date` arrives as its ISO string, a class instance as plain data without its methods, and an object with `toJSON()` as that method's result. Contracts whose `execute()` reads such values as objects (`intent.when.getTime()`) must parse them (`new Date(intent.when)`). Hooks that changed the intent to pass data to a later hook must pass it another way.
 - `revalidate()`'s `record` no longer includes raw thrown errors (`error.raw`) with `InMemoryStore`, matching `PostgresStore`.
+
+### Added
+
+- **[`examples/agent-tool-retry`](examples/agent-tool-retry)** (`npm run example:agent-retry`): a model retries a refund tool that timed out after the refund went through. Calling the API directly, an idempotency key per `toolCallId`, and corrobo keyed on `toolCallId` all refund twice, because the retry is a new tool call; corrobo keyed on the decision refunds once.
+- **[`examples/github-issue`](examples/github-issue)**: creating a GitHub issue, where search can lag, so a marker not found yet is `UNKNOWN`, never "not applied"; the conformance harness catches a variant that retries and posts a second issue. Contributed by @sergioprica (#25, #60).
+
+### Docs
+
+- README: when to use corrobo and when you don't need it, right after the opening; the Quickstart says how to run it, and its `reconcile()` compares the refund it found with the intent (it only counted refunds before, so one for another order or amount would have read as `APPLIED`); what `authoritative` means; how to choose `maxInFlightMs`; `examples/quickstart/README.md`.
+- The hook input types say each hook gets its own copy of the stored JSON form.
 
 ## 0.5.1 — 2026-10-05
 
