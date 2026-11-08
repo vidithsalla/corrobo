@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased (0.6.0)
+
+Hooks now act only on the recorded intent. This fixes an approval-binding bug and changes what hooks receive (see Breaking).
+
+### Security
+
+- **A hook that changed its `intent` could change what was executed (0.5.1 and earlier).** Every hook received the same intent object, so if `revalidate()` or `authorize()` modified it (`intent.amountCents = 500_000`), `execute()` sent the modified amount while the operation's recorded, approved intent stayed `5000`, and the attempt carried the approval for `5000`. The caller changing its own object while `runEffect()` was running did the same, and with the default fingerprint a later request that only fingerprinted equal to the recorded intent (`NaN` and the recorded `null`) was what `execute()` received. Now every hook gets its own fresh copy of the recorded intent as stored, and `revalidate()` its own copy of the record. Reported with reproductions by Ömer Faruk Koç (#46).
+
+### Breaking
+
+- **Hooks receive the stored (JSON) form of the intent with the default fingerprint too,** as they already did with a custom `fingerprintIntent()`. A `Date` arrives as its ISO string, a class instance as plain data without its methods, and an object with `toJSON()` as that method's result. Contracts whose `execute()` reads such values as objects (`intent.when.getTime()`) must parse them (`new Date(intent.when)`). Hooks that changed the intent to pass data to a later hook must pass it another way.
+- `revalidate()`'s `record` no longer includes raw thrown errors (`error.raw`) with `InMemoryStore`, matching `PostgresStore`.
+
 ## 0.5.1 — 2026-10-05
 
 Fixes from a round of independent review: an adversarial attacker review, an operator review, and a model-based test of the review flow with its own oracle. No breaking API changes. Custom stores should persist the new `ReservedAttemptInput.maxInFlightMs`, the same way as `check`. Drain 0.5.0 workers first, and don't shorten any contract's `maxInFlightMs` in the same deploy: attempts 0.5.0 left mid-flight have no recorded window, so they settle with the current one; let them finish first. An operation awaiting a review that 0.5.0 opened while a 0.4.0 decision was still on record gets a new review token once, on its next `runEffect()`; a decision made with the old token is refused (`STALE_REVIEW_TOKEN`) and needs the new one.

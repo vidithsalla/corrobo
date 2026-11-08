@@ -11,6 +11,10 @@ corrobo is a small TypeScript library for that moment. It records the operation 
 
 For actions an agent shouldn't take alone, it can also require a person's sign-off first. The approval answers one review, can expire, and is checked again before every retry ([human review](#human-review-before-an-action)).
 
+**Use it when** a call changes something outside your process (a payment, a message, a ticket), a timeout or crash can leave you unsure whether it happened, and the other system lets you look the result up afterwards.
+
+**You don't need it** for reads, for writes inside your own database transaction, or when the provider deduplicates every retry on an idempotency key for as long as you'll retry ([when keys are enough](#idempotency-keys-and-durable-workflows)). If the other system can't be asked what happened at all, corrobo can only tell you it doesn't know (`UNKNOWN`) and stop.
+
 ```
 execute  →  observe  →  reconcile  →  recover
 ```
@@ -25,7 +29,7 @@ npm install corrobo
 
 ## Quickstart
 
-Wrap one consequential call in an *effect contract*: how to do it, how to check it, and how to judge what you see. Here `payments` is your API client (in the runnable version, [`examples/quickstart`](examples/quickstart), it's a stand-in that loses the response after refunding).
+Wrap one consequential call in an *effect contract*: how to do it, how to check it, and how to judge what you see. Here `payments` is your API client. To run this exact code with a stand-in client that loses the response after refunding, clone the repo and run `npm ci && npm run quickstart` ([`examples/quickstart`](examples/quickstart)).
 
 ```ts
 import { runEffect, InMemoryStore, defineContract, observed, reconciled } from "corrobo";
@@ -39,16 +43,21 @@ const refundOrder = defineContract<{ orderId: string; amountCents: number }>()({
   execute: ({ intent, identity }) => payments.createRefund({ ...intent, reference: identity.id }),
 
   // 2. Ask the API what is actually true. Never infer it from execute()'s outcome.
+  //    authoritative: this lookup sees a refund the moment it's made, so "none found" proves
+  //    none. For a search that can lag, pass false and treat "none found" as UNKNOWN.
   observe: async ({ identity }) =>
-    observed((await payments.findRefunds(identity.id)).length, { source: "payments.findRefunds", authoritative: true }),
+    observed(await payments.findRefunds(identity.id), { source: "payments.findRefunds", authoritative: true }),
 
   // 3. Compare what you intended with what you observed.
-  reconcile: ({ observation }) => {
+  reconcile: ({ intent, observation }) => {
     if (observation.status !== "observed") return reconciled("UNKNOWN", "NO_READ", "Could not read refunds.");
-    const found = observation.data;
-    if (found === 0) return reconciled("NOT_APPLIED", "NO_REFUND", "No refund exists.");
-    if (found === 1) return reconciled("APPLIED", "REFUNDED", "Exactly one refund exists.");
-    return reconciled("CONFLICTED", "DUPLICATES", `${found} refunds exist.`);
+    const refunds = observation.data;
+    if (refunds.length === 0) return reconciled("NOT_APPLIED", "NO_REFUND", "No refund exists.");
+    const [refund] = refunds;
+    if (refunds.length === 1 && refund.orderId === intent.orderId && refund.amountCents === intent.amountCents) {
+      return reconciled("APPLIED", "REFUNDED", "The intended refund exists.");
+    }
+    return reconciled("CONFLICTED", "UNEXPECTED_REFUNDS", `${refunds.length} refund(s) don't match the plan.`);
   }
 });
 
@@ -56,13 +65,15 @@ async function main() {
   payments.loseNextResponse(); // the refund goes through, but the response is lost
 
   const result = await runEffect(new InMemoryStore(), refundOrder, {
-    identity: "refund-order-1001",
+    identity: "refund-request-8421", // minted once, when the refund was requested, and stored with it
     intent: { orderId: "1001", amountCents: 5_000 }
   });
 
   console.log(result.evidenceState, result.disposition); // APPLIED COMPLETE
   console.log("refunds made:", payments.refundCount()); // refunds made: 1
 }
+
+main();
 ```
 
 `execute()` threw, but corrobo didn't treat that as "not refunded": it asked, found the refund, and finished. Call `runEffect` again with the same store and `identity` (say, from a retry loop) and it returns the recorded result instead of refunding again. A new refund needs a new identity.
@@ -94,6 +105,16 @@ Two answers, kept separate on purpose: what the evidence shows, and what's safe 
 | `UNKNOWN` | It couldn't find out | `INVESTIGATE`, never a blind retry |
 
 **Requests can land late.** A timed-out request isn't undone, it's just unanswered, and it can still be applied after corrobo first looks. So when a failed call is followed by `NOT_APPLIED` while that request could still land, the `RETRY` comes with a `retryNotBefore` time (your declared `maxInFlightMs` after the attempt started): calling earlier does nothing, and calling after it makes corrobo check once more before it executes again. If you don't declare `maxInFlightMs`, the answer is `INVESTIGATE`. Details: [spec §O](docs/v0.1-spec.md#o-fencing-and-settlement-when-the-lock-is-not-enough).
+
+Choosing `maxInFlightMs`:
+
+| Your provider | `maxInFlightMs` |
+|---|---|
+| Deduplicates on an idempotency key you send on every attempt, for as long as you'll retry | `0` |
+| Says how long it can take to apply a request | your request timeout plus that bound |
+| Doesn't say | leave it out: an ambiguous failure becomes `INVESTIGATE` instead of a retry |
+
+Too short is the dangerous direction: a retry can then race a request that's still landing. `verifyEffectContract()` catches a window shorter than your fake's late landing.
 
 ## Human review before an action
 
