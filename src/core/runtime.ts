@@ -126,7 +126,31 @@ type ValidDecision = ReviewDecision;
 /** An EffectRequest after identity shorthand is resolved (see runEffect). */
 type ResolvedRequest<Intent, Context = unknown> = Omit<EffectRequest<Intent, Context>, "identity"> & {
   identity: OperationIdentity;
+  /** A fresh copy of the intent this pass acts on, for each hook (see intentCopier). */
+  intentOf?: () => Intent;
 };
+
+/**
+ * Each hook gets its own copy of the intent, taken from one reading made when runEffect() was
+ * called, so no hook (and no later change to the caller's object) can alter what another hook,
+ * execute() included, receives: an approval for one intent can't be spent on another. The
+ * copy keeps Dates as Dates; an intent a structured clone can't copy (an own toJSON(), say)
+ * is copied as its stored JSON form instead.
+ */
+function intentCopier<Intent>(intent: Intent, stored: unknown): () => Intent {
+  let source: unknown;
+  try {
+    source = structuredClone(intent);
+  } catch {
+    source = stored;
+  }
+  return () => structuredClone(source) as Intent;
+}
+
+/** The intent a hook receives: its own copy (see intentCopier). */
+function freshIntent<Intent>(request: ResolvedRequest<Intent, any>): Intent {
+  return request.intentOf ? request.intentOf() : request.intent;
+}
 
 /**
  * Thrown by reviewEffect() when another call holds this operation right now (it is being
@@ -791,7 +815,7 @@ async function performAttempt<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   base: AttemptBase,
-  intent: Intent,
+  intentOf: () => Intent,
   check?: PreExecuteCheck
 ): Promise<EffectResult<Observation>> {
   const { identity, attemptNumber } = base;
@@ -807,9 +831,9 @@ async function performAttempt<Intent, Observation, Evidence>(
   };
   const reservedRecord = await store.reserveAttempt(identity.id, reserved, base.version);
 
-  const transport = await safeExecute(contract, intent, identity, attemptNumber);
-  const { observation, stored } = await safeObserve(contract, intent, identity, transport, startedAt);
-  const reconciliation = safeReconcile(contract, { intent, transport, observation });
+  const transport = await safeExecute(contract, intentOf(), identity, attemptNumber);
+  const { observation, stored } = await safeObserve(contract, intentOf(), identity, transport, startedAt);
+  const reconciliation = safeReconcile(contract, { intent: intentOf(), transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
@@ -942,11 +966,12 @@ async function runRevalidate<Intent, Context>(
   let reason: unknown;
   try {
     const result: unknown = await contract.revalidate!({
-      intent: request.intent,
+      intent: freshIntent(request),
       identity: { ...record.identity },
       attemptNumber,
       approval: approval ? { ...approval } : null,
-      record,
+      // Its own copy: corrobo checks the approval against this record again after the hook.
+      record: structuredClone(record),
       context: request.context
     });
     // Read each field once, inside the try: a throwing getter fails closed like a throw.
@@ -999,7 +1024,7 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
   // fresh review.
   const unrecordedApproval = !approval && record.reviewReason !== undefined;
   if (!contract.revalidate && !approval && !unrecordedApproval) {
-    return performAttempt(store, contract, base, request.intent);
+    return performAttempt(store, contract, base, () => freshIntent(request));
   }
 
   // corrobo's own checks of the approval come first; revalidate() only sees a valid one.
@@ -1025,7 +1050,7 @@ async function checkThenAttempt<Intent, Observation, Evidence, Context>(
     checkedAt
   };
   if (result.outcome === "proceed") {
-    return performAttempt(store, contract, base, request.intent, { outcome: "proceed", ...checked });
+    return performAttempt(store, contract, base, () => freshIntent(request), { outcome: "proceed", ...checked });
   }
 
   const blockedBy: BlockingCheck = { outcome: result.outcome, ...checked, recordVersion: base.version + 1 };
@@ -1061,7 +1086,7 @@ async function recoverReservedAttempt<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   record: OperationRecord,
-  intent: Intent,
+  intentOf: () => Intent,
   reserved: ReservedAttempt
 ): Promise<EffectResult<Observation>> {
   const transport: TransportOutcome<Evidence> = {
@@ -1073,8 +1098,8 @@ async function recoverReservedAttempt<Intent, Observation, Evidence>(
     }
   };
 
-  const { observation, stored } = await safeObserve(contract, intent, record.identity, transport, reserved.startedAt);
-  const reconciliation = safeReconcile(contract, { intent, transport, observation });
+  const { observation, stored } = await safeObserve(contract, intentOf(), record.identity, transport, reserved.startedAt);
+  const reconciliation = safeReconcile(contract, { intent: intentOf(), transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
@@ -1103,12 +1128,12 @@ async function reObserve<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   record: OperationRecord,
-  intent: Intent,
+  intentOf: () => Intent,
   latest: ResolvedAttempt
 ): Promise<OperationRecord> {
   const transport = latest.transport as TransportOutcome<Evidence>;
-  const { observation, stored } = await safeObserve(contract, intent, record.identity, transport, latest.startedAt);
-  const reconciliation = safeReconcile(contract, { intent, transport, observation });
+  const { observation, stored } = await safeObserve(contract, intentOf(), record.identity, transport, latest.startedAt);
+  const reconciliation = safeReconcile(contract, { intent: intentOf(), transport, observation });
 
   const attempt = resolveAttempt(
     contract as EffectContract<unknown, unknown, unknown>,
@@ -1153,6 +1178,7 @@ export async function runEffect<Intent, Observation, Evidence, Context = unknown
   if (contract.fingerprintIntent) {
     (request as { intent: Intent }).intent = prepared.stored as Intent;
   }
+  request.intentOf = intentCopier(request.intent, prepared.stored);
   const lock = await store.tryAcquireLock(request.identity.id);
   if (!lock) {
     const existing = await store.getOperation(request.identity.id);
@@ -1279,7 +1305,7 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
 
   if (!existing) {
     const auth = contract.authorize
-      ? validAuthorization(await contract.authorize(request.intent, { identity: { ...request.identity }, context: request.context }))
+      ? validAuthorization(await contract.authorize(freshIntent(request), { identity: { ...request.identity }, context: request.context }))
       : { requiresReview: false };
     const initialStatus: OperationStatus = auth.requiresReview ? "AWAITING_REVIEW" : "OPEN";
     const created = await store.createOperation({
@@ -1331,7 +1357,9 @@ async function runCoordinated<Intent, Observation, Evidence, Context>(
   // default fingerprint a later request's intent is the same data (it fingerprinted equal to the
   // stored JSON form), but a custom fingerprintIntent() may call two intents "equal" while
   // ignoring fields execute() reads; a later request must never change what is executed.
-  const acting = contract.fingerprintIntent ? { ...request, intent: existing.intent as Intent } : request;
+  const acting = contract.fingerprintIntent
+    ? { ...request, intent: existing.intent as Intent, intentOf: intentCopier(existing.intent as Intent, existing.intent) }
+    : request;
   return await continueOpen(store, contract, existing, acting);
 }
 
@@ -1398,11 +1426,11 @@ async function continueOpen<Intent, Observation, Evidence, Context>(
   }
 
   if (latest.status === "RESERVED") {
-    return await recoverReservedAttempt(store, contract, existing, request.intent, latest);
+    return await recoverReservedAttempt(store, contract, existing, () => freshIntent(request), latest);
   }
 
   if (latest.evidenceState === "PENDING") {
-    return resultFromRecord(await reObserve(store, contract, existing, request.intent, latest));
+    return resultFromRecord(await reObserve(store, contract, existing, () => freshIntent(request), latest));
   }
 
   if (latest.disposition === "RETRY") {
@@ -1418,7 +1446,7 @@ async function continueOpen<Intent, Observation, Evidence, Context>(
     // under the current rules before any new attempt. A late landing shows up here as APPLIED (→ COMPLETE, no new attempt). This also
     // covers RETRYs recorded without a settlement window (e.g. by corrobo 0.2.x): with no
     // maxInFlightMs they now become INVESTIGATE instead of executing.
-    const settled = await reObserve(store, contract, existing, request.intent, latest);
+    const settled = await reObserve(store, contract, existing, () => freshIntent(request), latest);
     const settledLatest = settled.attempts[settled.attempts.length - 1];
     if (
       settled.status === "OPEN" &&

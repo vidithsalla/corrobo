@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Security
+
+- **A hook that changed its `intent` could change what was executed (0.5.1 and earlier).** Every hook received the same intent object, so if `revalidate()` or `authorize()` modified it (`intent.amountCents = 500_000`), `execute()` sent the modified amount while the operation's recorded, approved intent stayed `5000`, and the attempt carried the approval for `5000`. The same applied to the caller changing its own object while `runEffect()` was running. Now each hook gets its own copy of one reading of the intent taken when `runEffect()` is called (Dates stay Dates; an intent a structured clone can't copy, such as one with an own `toJSON()`, is copied as its stored JSON form), and `revalidate()` gets its own copy of the record. Hooks that relied on changing the intent to pass data to a later hook must pass it some other way. Reported with reproductions by Ömer Faruk Koç (#46).
+
 ## 0.5.1 — 2026-10-05
 
 Fixes from a round of independent review: an adversarial attacker review, an operator review, and a model-based test of the review flow with its own oracle. No breaking API changes. Custom stores should persist the new `ReservedAttemptInput.maxInFlightMs`, the same way as `check`. Drain 0.5.0 workers first, and don't shorten any contract's `maxInFlightMs` in the same deploy: attempts 0.5.0 left mid-flight have no recorded window, so they settle with the current one; let them finish first. An operation awaiting a review that 0.5.0 opened while a 0.4.0 decision was still on record gets a new review token once, on its next `runEffect()`; a decision made with the old token is refused (`STALE_REVIEW_TOKEN`) and needs the new one.
