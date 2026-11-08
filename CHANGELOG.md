@@ -11,8 +11,8 @@ Hooks now act only on the recorded intent. This fixes an approval-binding bug in
 ### Breaking
 
 - **Hooks receive the stored (JSON) form of the intent with the default fingerprint too,** as they already did with a custom `fingerprintIntent()`. A `Date` arrives as its ISO string, a class instance as plain data without its methods, and an object with `toJSON()` as that method's result. Contracts whose `execute()` reads such values as objects (`intent.when.getTime()`) must parse them (`new Date(intent.when)`). Hooks that changed the intent to pass data to a later hook must pass it another way.
-- **The hook input types say so too:** `ExecuteInput`, `ObserveInput`, `ReconcileInput` and `RevalidateInput` type `intent` as the new `StoredIntent<Intent>`, as do `authorize()` and a custom `fingerprintIntent()`. `StoredIntent<T>` is what JSON keeps (a `Date` becomes `string`, a `toJSON()` its result, function-valued properties are dropped), and it's the same type for an intent that is already plain JSON data. So `intent.when.getTime()` on a `Date` field is now a compile error instead of a runtime one.
-- `revalidate()`'s `record` is the record as JSON stores it, as `PostgresStore` returns it, with either store: no raw thrown errors (`error.raw`), and a `Date` in evidence arrives as a string. It shares no memory with the stored record.
+- `revalidate()`'s `record` is the record as JSON stores it, as `PostgresStore` returns it, with either store: no raw thrown errors (`error.raw`), a `Date` in evidence arrives as a string, and a `BigInt` as its decimal string. With `InMemoryStore`, evidence containing a cycle is the one case it's a structured clone instead, which shares any `SharedArrayBuffer`'s memory with the stored record.
+- The hook input types still say `intent: Intent`; their documentation says it's the stored JSON form. Read a `Date` field as a string (`new Date(intent.when)`).
 
 ### Added
 

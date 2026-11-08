@@ -310,4 +310,32 @@ describe("what hooks receive", () => {
     await runEffect(store, contract, { identity: "sab1", intent: { amountCents: 1 } });
     expect(new Uint8Array(shared)[0]).toBe(0);
   });
+
+  it("still copied by value when the evidence also holds a BigInt (no structured-clone fallback)", async () => {
+    const shared = new SharedArrayBuffer(4);
+    let attempt = 0;
+    const contract = defineContract<Credit>()({
+      operationType: "ledger/credit",
+      retryPolicy: { maxAttempts: 2, retryOnNotApplied: true },
+      maxInFlightMs: 0,
+      revalidate: ({ record }) => {
+        const transport = (record.attempts[0] as { transport?: { ok: boolean; evidence?: { buf?: unknown; n?: unknown } } } | undefined)?.transport;
+        const buf = transport?.ok ? transport.evidence?.buf : undefined;
+        if (buf instanceof SharedArrayBuffer) new Uint8Array(buf)[0] = 99;
+        return { decision: "proceed" };
+      },
+      execute: async () => {
+        attempt += 1;
+        return { n: 1n, buf: shared };
+      },
+      observe: async () => observed(attempt > 1 ? 1 : 0, { source: "ledger", authoritative: true }),
+      reconcile: ({ observation }) =>
+        observation.status === "observed" && observation.data > 0 ? reconciled("APPLIED", "DONE", "Done") : reconciled("NOT_APPLIED", "NONE", "None")
+    });
+    const store = new InMemoryStore();
+    await runEffect(store, contract, { identity: "sab2", intent: { amountCents: 1 } });
+    const second = await runEffect(store, contract, { identity: "sab2", intent: { amountCents: 1 } });
+    expect(new Uint8Array(shared)[0]).toBe(0);
+    expect(second.disposition).toBe("COMPLETE");
+  });
 });
