@@ -189,6 +189,11 @@ export interface ReviewRequest {
 }
 
 export interface RevalidateInput<Intent, Context> {
+  /**
+   * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
+   * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
+   * Changing it changes nothing else.
+   */
   intent: Intent;
   identity: OperationIdentity;
   /** The attempt about to be made: 1 for the first. */
@@ -237,12 +242,22 @@ export interface BlockingCheck extends PreExecuteCheck {
 }
 
 export interface ExecuteInput<Intent> {
+  /**
+   * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
+   * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
+   * Changing it changes nothing else.
+   */
   intent: Intent;
   identity: OperationIdentity;
   attemptNumber: number;
 }
 
 export interface ObserveInput<Intent, Evidence> {
+  /**
+   * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
+   * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
+   * Changing it changes nothing else.
+   */
   intent: Intent;
   identity: OperationIdentity;
   transport: TransportOutcome<Evidence>;
@@ -256,6 +271,11 @@ export interface ObserveInput<Intent, Evidence> {
 }
 
 export interface ReconcileInput<Intent, Observation, Evidence> {
+  /**
+   * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
+   * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
+   * Changing it changes nothing else.
+   */
   intent: Intent;
   transport: TransportOutcome<Evidence>;
   observation: ObservationResult<Observation>;
@@ -271,7 +291,8 @@ export interface EffectContract<Intent, Observation, Evidence, Context = unknown
    * human sign-off before anything is executed? Returning requiresReview:true produces
    * disposition REVIEW directly — a known action needing authorization, never a
    * reconciliation outcome. Whether it is still valid to act at the moment of each attempt is
-   * revalidate()'s question, not this one's.
+   * revalidate()'s question, not this one's. `intent` is its own copy of the stored JSON form
+   * (see ExecuteInput.intent).
    */
   authorize?(intent: Intent, input: AuthorizeInput<Context>): AuthorizationResult | Promise<AuthorizationResult>;
   /**
