@@ -42,7 +42,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 3.1 | `observe()` throws or times out | Unknown | `observation_failed` → (contract) `UNKNOWN` → `INVESTIGATE`, never `NOT_APPLIED` | No | No | Investigate | T25, T26, T27 |
 | 3.2 | Create succeeded but its read-back failed | Applied | `UNKNOWN` → `INVESTIGATE` (not assumed applied) | No | No | Investigate | T28 |
 | 3.3 | The re-check before a deferred retry can't read the target | Unknown | `UNKNOWN` → `INVESTIGATE` | No | No | Investigate | T29 |
-| 3.4 | Read is stale, from a replica, or a search that can't prove absence | Unknown | corrobo passes `authoritative` and `source` to `reconcile()` unchanged; the evidence state is whatever your `reconcile()` says. **Assumes:** a read that can't prove absence returns `UNKNOWN`, never `NOT_APPLIED` | Only if your contract says `NOT_APPLIED` | **Yes, if the contract is wrong** | Map weak reads to `UNKNOWN`; size `maxInFlightMs` to cover replication lag | T30, T31 |
+| 3.4 | Read is stale, from a replica, or a search that can't prove absence | Unknown | corrobo passes `authoritative` and `source` to `reconcile()` unchanged; the evidence state is whatever your `reconcile()` says. **Assumes:** a read that can't prove absence returns `UNKNOWN`, never `NOT_APPLIED` | Only if your contract says `NOT_APPLIED` | **Yes, if the contract is wrong** | Map weak reads to `UNKNOWN`; size `maxInFlightMs` to cover replication lag | T30, T31, T200, T201 |
 
 ## 4. Convergence (`PENDING`)
 
@@ -173,7 +173,7 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 | 11.1 | Provider idempotency key | Same key on every attempt of one operation; a new operation never reuses it | T92, T93 |
 | 11.2 | A lost response, or a re-check long after the attempt (past the key's retention, e.g. Stripe's ~24h) | The read-back finds the refund by the operation id the request carried in its metadata, so it never relies on the key's retention; the request is only re-sent by a retry, with the same key | T94, T184 |
 | 11.3 | Stable provider id known from `execute()` | Later checks look it up directly | T95 |
-| 11.4 | Lookup only by search/listing | **Assumes:** your contract returns `UNKNOWN` when absence can't be proven — see 3.4 | T30 |
+| 11.4 | Lookup only by search/listing | **Assumes:** your contract returns `UNKNOWN` when absence can't be proven — see 3.4. [`examples/github-issue`](../examples/github-issue) shows it: an issue marker found by search is `APPLIED`, none found is `UNKNOWN`, and a variant that treats "none found" as `NOT_APPLIED` posts duplicates while search lags | T30, T200, T201 |
 | 11.5 | An `observe()` that could create the effect (e.g. replaying the create request as its "read-back") | Not allowed: `observe()` runs where nothing may execute (crash recovery, re-checks, after an approval expired), so it must only read. The Stripe example reads only; an expired approval leads to review, not a refund | T181 |
 | 11.6 | Stripe example: an unlabeled refund of the same amount on the charge (made before refunds were labeled, or by hand) | Absence can't be proven: `UNKNOWN` (`UNLABELED_REFUND_PRESENT`), never a second refund | T187 |
 
@@ -391,5 +391,7 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T197** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "revalidate() mutating its intent doesn't change the approved amount execute() sends"
 - **T198** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "authorize() mutating its intent doesn't change the first attempt"
 - **T199** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "a later request that only fingerprints equal (NaN vs the recorded null) can't change what execute() sends"
+- **T200** [`tests/github-issue.test.ts`](../tests/github-issue.test.ts) — "passes the conformance harness: embeds operation marker, marks search non-authoritative, and never duplicates"
+- **T201** [`tests/github-issue.test.ts`](../tests/github-issue.test.ts) — "catches the broken variant that maps 'not found -> NOT_APPLIED' and retries: with search lagging behind writes, it posts a second issue"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"
