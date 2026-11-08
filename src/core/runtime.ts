@@ -24,6 +24,7 @@ import type {
   TokenlessReview,
   ReservedAttempt,
   ResolvedAttempt,
+  StoredIntent,
   TransportOutcome
 } from "./types";
 
@@ -127,7 +128,7 @@ type ValidDecision = ReviewDecision;
 type ResolvedRequest<Intent, Context = unknown> = Omit<EffectRequest<Intent, Context>, "identity"> & {
   identity: OperationIdentity;
   /** A fresh copy of the intent this pass acts on, for each hook (see intentCopier). */
-  intentOf?: () => Intent;
+  intentOf?: () => StoredIntent<Intent>;
 };
 
 /**
@@ -138,15 +139,17 @@ type ResolvedRequest<Intent, Context = unknown> = Omit<EffectRequest<Intent, Con
  * but differ (NaN and null, a Date and its ISO string) can't diverge here either: hooks only ever
  * see the stored form.
  */
-function intentCopier<Intent>(recorded: unknown): () => Intent {
+function intentCopier<Intent>(recorded: unknown): () => StoredIntent<Intent> {
   const json = JSON.stringify(recorded);
-  return () => JSON.parse(json) as Intent;
+  return () => JSON.parse(json) as StoredIntent<Intent>;
 }
 
 /**
  * The record revalidate() is handed: its own copy, so editing it can't change the checks corrobo
- * makes after the hook. Raw thrown errors (kept only by InMemoryStore) are left out; PostgresStore
- * never stores them either.
+ * makes after the hook. It's the record as JSON stores it, as PostgresStore returns it: no shared
+ * memory (a structured clone shares a SharedArrayBuffer), and no raw thrown errors (kept only by
+ * InMemoryStore). Only a record JSON can't hold (a BigInt in evidence, kept by InMemoryStore)
+ * falls back to a structured clone.
  */
 function recordForHook(record: OperationRecord): OperationRecord {
   const withoutRaw = (error: { message: string; raw?: unknown }) => ({ message: error.message });
@@ -163,15 +166,15 @@ function recordForHook(record: OperationRecord): OperationRecord {
   );
   const stripped = { ...record, attempts };
   try {
-    return structuredClone(stripped);
-  } catch {
     return JSON.parse(JSON.stringify(stripped)) as OperationRecord;
+  } catch {
+    return structuredClone(stripped);
   }
 }
 
 /** The intent a hook receives: its own copy (see intentCopier). */
-function freshIntent<Intent>(request: ResolvedRequest<Intent, any>): Intent {
-  return request.intentOf ? request.intentOf() : request.intent;
+function freshIntent<Intent>(request: ResolvedRequest<Intent, any>): StoredIntent<Intent> {
+  return request.intentOf ? request.intentOf() : (request.intent as StoredIntent<Intent>);
 }
 
 /**
@@ -480,7 +483,7 @@ function storableReason(value: unknown): ReasonCode | undefined {
 /** execute() is caught here — a throw or timeout becomes transport evidence, never an uncaught rejection. */
 async function safeExecute<Intent, Evidence>(
   contract: EffectContract<Intent, unknown, Evidence>,
-  intent: Intent,
+  intent: StoredIntent<Intent>,
   identity: OperationRecord["identity"],
   attemptNumber: number
 ): Promise<TransportOutcome<Evidence>> {
@@ -528,7 +531,7 @@ function snapshotObservation(observation: unknown): { stored: unknown; raw: { pr
  */
 async function safeObserve<Intent, Observation, Evidence>(
   contract: EffectContract<Intent, Observation, Evidence>,
-  intent: Intent,
+  intent: StoredIntent<Intent>,
   identity: OperationRecord["identity"],
   transport: TransportOutcome<Evidence>,
   attemptStartedAt: string
@@ -837,7 +840,7 @@ async function performAttempt<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   base: AttemptBase,
-  intentOf: () => Intent,
+  intentOf: () => StoredIntent<Intent>,
   check?: PreExecuteCheck
 ): Promise<EffectResult<Observation>> {
   const { identity, attemptNumber } = base;
@@ -1108,7 +1111,7 @@ async function recoverReservedAttempt<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   record: OperationRecord,
-  intentOf: () => Intent,
+  intentOf: () => StoredIntent<Intent>,
   reserved: ReservedAttempt
 ): Promise<EffectResult<Observation>> {
   const transport: TransportOutcome<Evidence> = {
@@ -1150,7 +1153,7 @@ async function reObserve<Intent, Observation, Evidence>(
   store: CoordinatedStore,
   contract: EffectContract<Intent, Observation, Evidence>,
   record: OperationRecord,
-  intentOf: () => Intent,
+  intentOf: () => StoredIntent<Intent>,
   latest: ResolvedAttempt
 ): Promise<OperationRecord> {
   const transport = latest.transport as TransportOutcome<Evidence>;

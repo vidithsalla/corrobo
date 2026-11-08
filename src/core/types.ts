@@ -188,13 +188,31 @@ export interface ReviewRequest {
   decision: ReviewDecision;
 }
 
+/**
+ * An intent as corrobo stores it, and as every hook receives it: what `JSON.stringify` keeps. A
+ * `Date` (or anything with `toJSON()`) becomes that method's result, functions are dropped, and
+ * values JSON can't hold aren't representable. For an intent that is already plain JSON data,
+ * this is the same type.
+ */
+export type StoredIntent<T> = T extends { toJSON(): infer R }
+  ? StoredIntent<R>
+  : T extends string | number | boolean | null
+    ? T
+    : T extends bigint | symbol | undefined | ((...args: never[]) => unknown)
+      ? never
+      : T extends readonly unknown[]
+        ? { -readonly [K in keyof T]: StoredIntent<T[K]> }
+        : T extends object
+          ? { [K in keyof T as T[K] extends (...args: never[]) => unknown ? never : K]: StoredIntent<T[K]> }
+          : T;
+
 export interface RevalidateInput<Intent, Context> {
   /**
    * This hook's own copy of the recorded intent, in its stored JSON form: a `Date` arrives as
    * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
    * Changing it changes nothing else.
    */
-  intent: Intent;
+  intent: StoredIntent<Intent>;
   identity: OperationIdentity;
   /** The attempt about to be made: 1 for the first. */
   attemptNumber: number;
@@ -247,7 +265,7 @@ export interface ExecuteInput<Intent> {
    * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
    * Changing it changes nothing else.
    */
-  intent: Intent;
+  intent: StoredIntent<Intent>;
   identity: OperationIdentity;
   attemptNumber: number;
 }
@@ -258,7 +276,7 @@ export interface ObserveInput<Intent, Evidence> {
    * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
    * Changing it changes nothing else.
    */
-  intent: Intent;
+  intent: StoredIntent<Intent>;
   identity: OperationIdentity;
   transport: TransportOutcome<Evidence>;
   /**
@@ -276,7 +294,7 @@ export interface ReconcileInput<Intent, Observation, Evidence> {
    * its ISO string, a class instance as plain data, an object with `toJSON()` as its result.
    * Changing it changes nothing else.
    */
-  intent: Intent;
+  intent: StoredIntent<Intent>;
   transport: TransportOutcome<Evidence>;
   observation: ObservationResult<Observation>;
 }
@@ -294,7 +312,7 @@ export interface EffectContract<Intent, Observation, Evidence, Context = unknown
    * revalidate()'s question, not this one's. `intent` is its own copy of the stored JSON form
    * (see ExecuteInput.intent).
    */
-  authorize?(intent: Intent, input: AuthorizeInput<Context>): AuthorizationResult | Promise<AuthorizationResult>;
+  authorize?(intent: StoredIntent<Intent>, input: AuthorizeInput<Context>): AuthorizationResult | Promise<AuthorizationResult>;
   /**
    * Runs under the operation's lock immediately before EVERY attempt, including the first
    * (after an approval, and after a RETRY's settlement check), and before the attempt is
@@ -327,7 +345,7 @@ export interface EffectContract<Intent, Observation, Evidence, Context = unknown
    * later request's: two intents your fingerprint calls equal are the same operation, and the
    * one that was recorded (and reviewed) is the one executed.
    */
-  fingerprintIntent?(intent: Intent): string;
+  fingerprintIntent?(intent: StoredIntent<Intent>): string;
   /**
    * Upper bound, in milliseconds, on how long after an attempt starts its effect could still
    * land at the external system — at least your execute() client timeout plus any

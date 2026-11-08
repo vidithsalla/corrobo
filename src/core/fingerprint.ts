@@ -1,4 +1,4 @@
-import type { EffectContract } from "./types";
+import type { EffectContract, StoredIntent } from "./types";
 
 /**
  * Deterministic canonicalization of an intent: exactly what JSON persistence keeps, with object
@@ -111,7 +111,7 @@ export function fingerprintIntent<Intent>(
     // runEffect() records, and fingerprints, a custom-fingerprint intent's JSON form; so does this.
     const json = JSON.stringify(intent);
     if (json === undefined) throw new TypeError("corrobo: the intent can't be fingerprinted as JSON (it is undefined).");
-    return contract.fingerprintIntent(JSON.parse(json) as Intent);
+    return contract.fingerprintIntent(JSON.parse(json) as StoredIntent<Intent>);
   }
   return canonicalStringify(intent);
 }

@@ -2,7 +2,7 @@
 
 ## 0.6.0 — 2026-11-08
 
-Hooks now act only on the recorded intent. This fixes an approval-binding bug in 0.5.1 and earlier, and changes what hooks receive (see Breaking). Upgrade if you use review or `revalidate()`. No schema change: no `migrate()` needed, and 0.5.x and 0.6.0 workers can share a table during a rolling deploy (records are unchanged; only what hooks receive differs).
+Hooks now act only on the recorded intent. This fixes an approval-binding bug in 0.5.1 and earlier, and changes what hooks receive (see Breaking). Upgrade if you use review or `revalidate()`. No schema change: no `migrate()` needed. **Drain 0.5.x workers before 0.6.0 serves traffic:** a 0.5.x worker sharing the table still hands hooks the caller's object (the bug below), so it could execute an operation a 0.6.0 worker recorded and got approved with something other than the recorded intent.
 
 ### Security
 
@@ -11,7 +11,8 @@ Hooks now act only on the recorded intent. This fixes an approval-binding bug in
 ### Breaking
 
 - **Hooks receive the stored (JSON) form of the intent with the default fingerprint too,** as they already did with a custom `fingerprintIntent()`. A `Date` arrives as its ISO string, a class instance as plain data without its methods, and an object with `toJSON()` as that method's result. Contracts whose `execute()` reads such values as objects (`intent.when.getTime()`) must parse them (`new Date(intent.when)`). Hooks that changed the intent to pass data to a later hook must pass it another way.
-- `revalidate()`'s `record` no longer includes raw thrown errors (`error.raw`) with `InMemoryStore`, matching `PostgresStore`.
+- **The hook input types say so too:** `ExecuteInput`, `ObserveInput`, `ReconcileInput` and `RevalidateInput` type `intent` as the new `StoredIntent<Intent>`, as do `authorize()` and a custom `fingerprintIntent()`. `StoredIntent<T>` is what JSON keeps (a `Date` becomes `string`, a `toJSON()` its result, function-valued properties are dropped), and it's the same type for an intent that is already plain JSON data. So `intent.when.getTime()` on a `Date` field is now a compile error instead of a runtime one.
+- `revalidate()`'s `record` is the record as JSON stores it, as `PostgresStore` returns it, with either store: no raw thrown errors (`error.raw`), and a `Date` in evidence arrives as a string. It shares no memory with the stored record.
 
 ### Added
 
