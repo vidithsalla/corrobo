@@ -1,6 +1,6 @@
 {
   "name": "corrobo",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "When an API call times out, check whether the write happened before retrying it. Human approvals for agent actions, tied to one review. TypeScript, zero dependencies.",
   "license": "MIT",
   "homepage": "https://github.com/vidithsalla/corrobo#readme",

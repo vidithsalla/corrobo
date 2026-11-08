@@ -145,8 +145,9 @@ function intentCopier<Intent>(recorded: unknown): () => Intent {
 
 /**
  * The record revalidate() is handed: its own copy, so editing it can't change the checks corrobo
- * makes after the hook. Raw thrown errors (kept only by InMemoryStore) are left out; PostgresStore
- * never stores them either.
+ * makes after the hook. It's the record as JSON stores it (a BigInt as its decimal string), as
+ * PostgresStore returns it: no shared memory and no raw thrown errors (kept only by InMemoryStore).
+ * Only a record with a cycle falls back to a structured clone.
  */
 function recordForHook(record: OperationRecord): OperationRecord {
   const withoutRaw = (error: { message: string; raw?: unknown }) => ({ message: error.message });
@@ -163,9 +164,11 @@ function recordForHook(record: OperationRecord): OperationRecord {
   );
   const stripped = { ...record, attempts };
   try {
-    return structuredClone(stripped);
+    return JSON.parse(JSON.stringify(stripped, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))) as OperationRecord;
   } catch {
-    return JSON.parse(JSON.stringify(stripped)) as OperationRecord;
+    // Only a cycle (InMemoryStore can hold one in evidence) gets here. A structured clone keeps
+    // it, but shares any SharedArrayBuffer's memory with the stored record.
+    return structuredClone(stripped);
   }
 }
 
