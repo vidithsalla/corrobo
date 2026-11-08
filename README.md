@@ -12,6 +12,7 @@ corrobo is a small TypeScript library for that moment. It records the operation 
 For actions an agent shouldn't take alone, it can also require a person's sign-off first. The approval answers one review, can expire, and is checked again before every retry ([human review](#human-review-before-an-action)).
 
 **Use it when** a call changes something outside your process (a payment, a message, a ticket), a timeout or crash can leave you unsure whether it happened, and the other system lets you look the result up afterwards.
+
 **You don't need it** for reads, for writes inside your own database transaction, or when the provider deduplicates every retry on an idempotency key for as long as you'll retry ([when keys are enough](#idempotency-keys-and-durable-workflows)). If the other system can't be asked what happened at all, corrobo can only tell you it doesn't know (`UNKNOWN`) and stop.
 
 ```
