@@ -84,6 +84,7 @@ describe("GitHub issue creation example (search cannot prove absence -> UNKNOWN,
 
     const lateLanding = report.results.find((r) => r.scenario === "late-landing")!;
     expect(lateLanding.status).toBe("fail");
-    expect(lateLanding.effects).toBe(2);
+    // Each retry while search lags posts another issue; with three attempts allowed that is up to 3.
+    expect(lateLanding.effects).toBeGreaterThan(1);
   });
 });

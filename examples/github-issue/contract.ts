@@ -173,7 +173,7 @@ export function createGitHubIssueContract(client: GitHubIssuesClientLike) {
     operationType: "github/create-issue",
     capabilities: {
       nativeIdempotency: false,
-      callerGeneratedIdentity: false,
+      callerGeneratedIdentity: true, // the operation id is embedded in the issue body as a marker
       optimisticConcurrency: false,
       convergence: false
     },
