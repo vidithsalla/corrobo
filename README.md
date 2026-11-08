@@ -53,7 +53,8 @@ const refundOrder = defineContract<{ orderId: string; amountCents: number }>()({
     if (observation.status !== "observed") return reconciled("UNKNOWN", "NO_READ", "Could not read refunds.");
     const refunds = observation.data;
     if (refunds.length === 0) return reconciled("NOT_APPLIED", "NO_REFUND", "No refund exists.");
-    if (refunds.length === 1 && refunds[0].amountCents === intent.amountCents) {
+    const [refund] = refunds;
+    if (refunds.length === 1 && refund.orderId === intent.orderId && refund.amountCents === intent.amountCents) {
       return reconciled("APPLIED", "REFUNDED", "The intended refund exists.");
     }
     return reconciled("CONFLICTED", "UNEXPECTED_REFUNDS", `${refunds.length} refund(s) don't match the plan.`);
