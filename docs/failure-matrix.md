@@ -147,6 +147,7 @@ Vocabulary: evidence states `APPLIED` · `NOT_APPLIED` · `CONFLICTED` · `PENDI
 | 9.7 | A new identity | A genuinely new operation | Yes (it's new) | T75 |
 | 9.12 | Custom `fingerprintIntent()` that ignores a field `execute()` reads; a later request differs in it | Same operation; corrobo acts on the recorded (reviewed) intent, never the later request's | Only as recorded | T180 |
 | 9.13 | Custom `fingerprintIntent()`; the intent's `toJSON()` differs from the object, and a reviewer passes `fingerprintIntent(contract, intent)` of that object | The exported `fingerprintIntent()` uses the JSON form, as `runEffect()` does, so the approval matches | Once approved | T190 |
+| 9.14 | A hook (`authorize()`, `revalidate()`, `execute()`, `observe()`, `reconcile()`) changes the intent it receives; the caller changes its own object while `runEffect()` runs; or a later request only fingerprints equal to the recorded intent (`NaN` vs the recorded `null`) | Every hook receives its own copy of the recorded intent as stored: `execute()` sends what was recorded and approved, and later hooks see it unchanged; a `revalidate()` that edits the record it's given doesn't change corrobo's approval check | Only as recorded | T197, T198, T199 |
 
 ## 10. Persistence and privacy
 
@@ -387,5 +388,8 @@ Error **messages** are still persisted: if your code puts secrets into an error 
 - **T194** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "PostgresStore: observe() throwing an error whose message contains U+0000 still resolves the attempt"
 - **T195** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "InMemoryStore: an error.raw that observe() returns itself is kept by reference, not copied"
 - **T196** [`tests/hook-results.test.ts`](../tests/hook-results.test.ts) — "%s: observe() returning observation_failed with an Error as its error keeps the error's message"
+- **T197** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "revalidate() mutating its intent doesn't change the approved amount execute() sends"
+- **T198** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "authorize() mutating its intent doesn't change the first attempt"
+- **T199** [`tests/intent-isolation.test.ts`](../tests/intent-isolation.test.ts) — "a later request that only fingerprints equal (NaN vs the recorded null) can't change what execute() sends"
 - **T176** [`tests/review-state-machine.test.ts`](../tests/review-state-machine.test.ts) — "holds every invariant across 40 random seeds of 40 steps, persisted through Postgres"
 - **T159** [`tests/review-approval.test.ts`](../tests/review-approval.test.ts) — "an approval on record without a reviewer isn't honored: it needs a new review"
